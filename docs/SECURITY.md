@@ -192,7 +192,7 @@ composer test:coverage
 
 ## 📜 Histórico de Segurança
 
-### 2025-02-05 - v1.0.0
+### 2026-02-05 - v1.0.0
 - ✅ Lançamento inicial
 - ✅ Todas as validações implementadas
 - ✅ Zero vulnerabilidades conhecidas
