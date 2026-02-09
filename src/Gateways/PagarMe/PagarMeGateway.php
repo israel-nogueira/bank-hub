@@ -31,7 +31,7 @@ use IsraelNogueira\PaymentHub\Enums\PaymentStatus;
 use IsraelNogueira\PaymentHub\Enums\Currency;
 use IsraelNogueira\PaymentHub\ValueObjects\Money;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
-
+ 
 class PagarMeGateway implements PaymentGatewayInterface
 {
     private const PRODUCTION_URL = 'https://api.pagar.me/core/v5';

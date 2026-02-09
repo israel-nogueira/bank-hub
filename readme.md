@@ -40,6 +40,7 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 | 🧪 **FakeBankGateway** | ✅ Pronto | **TODOS** os métodos (PIX, Cartões, Boleto, Assinaturas, Split, Escrow, etc.) - **Perfeito para desenvolvimento e testes SEM precisar de API real!** | [📖 Docs](src/Gateways/FakeBank/FakeBankGateway.md) |
 | 🟣 **Asaas** | ✅ Pronto | PIX, Cartão de Crédito, Boleto, Assinaturas, Split, Sub-contas, Wallets, Escrow, Transferências, Clientes, Refunds | [📖 Docs](src/Gateways/Asaas/AsaasGateway.md) |
 | 🟡 **Pagar.me** | ✅ Pronto | PIX, Cartão Crédito/Débito, Boleto, Assinaturas, Split, Recipients, Clientes, Refunds, Pre-auth, Webhooks | [📖 Docs](src/Gateways/PagarMe/PagarMeGateway.md) |
+| 🟣 **C6 Bank** | ✅ Pronto | PIX, Cartão Crédito/Débito, Boleto, Assinaturas, Split, Sub-contas, Wallets, Escrow, Transferências, Clientes, Refunds, Payment Links | [📖 Docs](src/Gateways/C6bank/C6BankGateway.md) |
 | 🌎 **EBANX** | ✅ Pronto | PIX, Cartão Crédito/Débito, Boleto, Recorrência, Refunds, Pre-auth, Multi-país (7 países) | [📖 Docs](src/Gateways/Ebanx/EbanxGateway.md) |
 | 💚 **MercadoPago** | ✅ Pronto | PIX, Cartão Crédito/Débito, Boleto, Assinaturas, Split, Clientes, Refunds, Pre-auth | [📖 Docs](src/Gateways/MercadoPago/MercadoPagoGateway.md) |
 | 🟠 **PagSeguro** | ✅ Pronto | PIX, Cartão Crédito/Débito, Boleto, Assinaturas, Split, Clientes, Refunds, Pre-auth | [📖 Docs](src/Gateways/PagSeguro/PagSeguroGateway.md) |
@@ -50,7 +51,7 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 
 > 🧪 **FakeBankGateway**: Gateway simulado completo que funciona **SEM internet, SEM API keys, SEM sandbox**. Use para desenvolver toda sua aplicação localmente e só conecte com APIs reais quando estiver pronto para produção!
 > 
-> 📝 **Nota**: Gateways brasileiros (Asaas, Pagar.me, MercadoPago, PagSeguro, EBANX) suportam PIX e Boleto. Gateways internacionais (Stripe, PayPal, Adyen) não suportam esses métodos nativos do Brasil.
+> 📝 **Nota**: Gateways brasileiros (Asaas, Pagar.me, C6 Bank, MercadoPago, PagSeguro, EBANX) suportam PIX e Boleto. Gateways internacionais (Stripe, PayPal, Adyen) não suportam esses métodos nativos do Brasil.
 > 
 > 🌎 **EBANX**: Gateway especializado em pagamentos internacionais para América Latina (7 países).
 
