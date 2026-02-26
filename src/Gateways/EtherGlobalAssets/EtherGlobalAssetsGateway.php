@@ -1,6 +1,6 @@
 <?php
 
-namespace IsraelNogueira\PaymentHub\Gateways;
+namespace IsraelNogueira\PaymentHub\Gateways\EtherGlobalAssets;
 
 use IsraelNogueira\PaymentHub\Contracts\PaymentGatewayInterface;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
@@ -31,7 +31,7 @@ use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 
 class EtherGlobalAssetsGateway implements PaymentGatewayInterface
 {
-    private const BASE_URL = 'https://api.etherglobalassets.com';
+	private const BASE_URL = 'https://api.etherglobalassets.com.br';
     private const TOKEN_EXPIRATION = 3600; // 1 hora
     
     private string $clientId;
@@ -54,12 +54,12 @@ class EtherGlobalAssetsGateway implements PaymentGatewayInterface
             'clientSecret' => $this->clientSecret,
         ], false);
 
-        if (!isset($response['accessToken'])) {
-            throw new GatewayException('Failed to authenticate with Ether Global Assets');
-        }
+		if (!isset($response['access_token'])) {
+			throw new GatewayException('Failed to authenticate with Ether Global Assets');
+		}
+		$this->accessToken = $response['access_token'];
+		$this->tokenExpiresAt = time() + ($response['expires_in'] ?? self::TOKEN_EXPIRATION);
 
-        $this->accessToken = $response['accessToken'];
-        $this->tokenExpiresAt = time() + ($response['expiresIn'] ?? self::TOKEN_EXPIRATION);
     }
 
     private function getToken(): string
