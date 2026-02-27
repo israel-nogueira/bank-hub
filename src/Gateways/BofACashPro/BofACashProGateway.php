@@ -41,7 +41,7 @@ use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
  *
  *  MÉTODOS DE TRANSFERÊNCIA SUPORTADOS
  *  ------------------------------------
- *  | Método | Velocidade   | Limite típico | Reversível |
+ *  | Método | Velocidade   | Limite típico  | Reversível |
  *  |--------|-------------|----------------|------------|
  *  | Zelle  | Instantâneo | Negociado BofA | NÃO        |
  *  | ACH    | Same-day/3d | Sem limite real| Sim (antes liquidação) |
@@ -74,8 +74,19 @@ use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
  *  @see https://developer.bankofamerica.com
  *  @see BofACashPro_API_Skills.md (documentação de capacidades)
  *
+ *  NOTAS DE SEGURANÇA (v1.1.0)
+ *  ----------------------------
+ *  - TLS verificado explicitamente em todas as chamadas cURL (CURLOPT_SSL_VERIFYPEER).
+ *  - Routing numbers validados com dígito verificador ABA antes do envio.
+ *  - Telefones Zelle validados no formato E.164.
+ *  - effectiveDate validada como data futura antes do envio ao BofA.
+ *  - Dados bancários sensíveis mascarados no rawResponse.
+ *  - Retry automático com exponential backoff para erros transitórios (429, 503).
+ *  - generateRequestId() usa 8 bytes de entropia (64 bits).
+ *  - array_filter() substituído por remoção explícita de nulls.
+ *
  * @author  PaymentHub
- * @version 1.0.0
+ * @version 1.1.0
  */
 class BofACashProGateway implements PaymentGatewayInterface
 {
@@ -129,6 +140,12 @@ class BofACashProGateway implements PaymentGatewayInterface
      */
     private const ACH_THRESHOLD = 50000.00;
 
+    /**
+     * Número máximo de tentativas para erros transitórios (429, 503).
+     * A cada tentativa o intervalo de espera dobra (exponential backoff).
+     */
+    private const MAX_RETRY_ATTEMPTS = 3;
+
     // ----------------------------------------------------------
     //  Estado interno do gateway
     // ----------------------------------------------------------
@@ -139,12 +156,18 @@ class BofACashProGateway implements PaymentGatewayInterface
     /** URL OAuth resolvida de acordo com o modo sandbox/produção. */
     private string $oauthUrl;
 
-    /** Token de acesso OAuth2 em cache. Renovado automaticamente ao expirar. */
+    /**
+     * Token de acesso OAuth2 em cache. Renovado automaticamente ao expirar.
+     *
+     * AVISO: Esta classe NÃO é thread-safe. Em ambientes com múltiplos workers
+     * (PHP-FPM, Swoole, RoadRunner), cada worker deve ter sua própria instância.
+     * Não registre esta classe como singleton compartilhado entre requests concorrentes.
+     */
     private ?string $accessToken = null;
 
     /**
      * Timestamp UNIX em que o token atual expira.
-     * Calculado como: time() + expires_in - margem de segurança.
+     * Calculado como: time() + expires_in - margem de segurança (60s).
      */
     private ?int $tokenExpiresAt = null;
 
@@ -155,12 +178,12 @@ class BofACashProGateway implements PaymentGatewayInterface
     /**
      * Instancia o gateway CashPro do Bank of America.
      *
-     * @param string $clientId      Client ID obtido no Developer Portal do BofA.
-     * @param string $clientSecret  Client Secret recebido via Secure Message (~15 dias após onboarding).
-     * @param string $accountId     ID da conta BofA corporativa que receberá/enviará os pagamentos.
-     * @param bool   $sandbox       true = ambiente de sandbox (testes), false = produção.
-     * @param float  $zelleThreshold  Limite máximo em USD para usar Zelle (padrão: $3.500).
-     * @param float  $achThreshold    Limite máximo em USD para usar ACH (padrão: $50.000).
+     * @param string $clientId       Client ID obtido no Developer Portal do BofA.
+     * @param string $clientSecret   Client Secret recebido via Secure Message (~15 dias após onboarding).
+     * @param string $accountId      ID da conta BofA corporativa que receberá/enviará os pagamentos.
+     * @param bool   $sandbox        true = ambiente de sandbox (testes), false = produção.
+     * @param float  $zelleThreshold Limite máximo em USD para usar Zelle (padrão: $3.500).
+     * @param float  $achThreshold   Limite máximo em USD para usar ACH (padrão: $50.000).
      *
      * Exemplo:
      *   $gateway = new BofACashProGateway(
@@ -198,6 +221,8 @@ class BofACashProGateway implements PaymentGatewayInterface
      * Uma margem de 60 segundos é subtraída do expires_in para
      * evitar que um token prestes a expirar seja usado em chamadas longas.
      *
+     * SEGURANÇA: TLS verificado explicitamente (CURLOPT_SSL_VERIFYPEER = true).
+     *
      * @throws GatewayException Se a autenticação falhar (credenciais inválidas, IP não cadastrado, etc.)
      */
     private function authenticate(): void
@@ -218,6 +243,9 @@ class BofACashProGateway implements PaymentGatewayInterface
             ],
             CURLOPT_TIMEOUT        => 15,
             CURLOPT_CONNECTTIMEOUT => 10,
+            // [CORREÇÃO CRÍTICA 1] TLS explicitamente verificado — previne ataques MITM
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
         ]);
 
         $body     = curl_exec($ch);
@@ -270,9 +298,11 @@ class BofACashProGateway implements PaymentGatewayInterface
      * Utiliza cURL nativo (sem dependências externas), seguindo o
      * padrão dos demais gateways do PaymentHub.
      *
-     * Estratégia de retry: não implementada aqui para manter a classe
-     * focada. Recomenda-se um decorator/middleware de retry na camada
-     * de orquestração (PaymentHub) para lidar com erros transitórios (429, 503).
+     * RETRY: Realiza até MAX_RETRY_ATTEMPTS tentativas com exponential backoff
+     * para erros transitórios HTTP 429 (rate limit) e 503 (indisponibilidade).
+     * Erros definitivos (4xx exceto 429) são lançados imediatamente.
+     *
+     * SEGURANÇA: TLS verificado explicitamente (CURLOPT_SSL_VERIFYPEER = true).
      *
      * @param string $method    Verbo HTTP: GET, POST, PUT, DELETE.
      * @param string $endpoint  Caminho relativo à baseUrl (ex: '/payments').
@@ -281,7 +311,7 @@ class BofACashProGateway implements PaymentGatewayInterface
      *
      * @return array Resposta decodificada como array associativo.
      *
-     * @throws GatewayException Para erros HTTP (4xx, 5xx) ou falhas de rede.
+     * @throws GatewayException Para erros HTTP (4xx, 5xx) ou falhas de rede após esgotados os retries.
      */
     private function request(
         string $method,
@@ -303,13 +333,14 @@ class BofACashProGateway implements PaymentGatewayInterface
             'X-Request-ID: ' . $this->generateRequestId(),
         ];
 
-        $ch = curl_init($url);
-
         $curlOpts = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_TIMEOUT        => 30,
             CURLOPT_CONNECTTIMEOUT => 10,
+            // [CORREÇÃO CRÍTICA 1] TLS explicitamente verificado — previne ataques MITM
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
         ];
 
         match ($method) {
@@ -319,29 +350,187 @@ class BofACashProGateway implements PaymentGatewayInterface
             default  => null, // GET não precisa de configuração adicional
         };
 
-        curl_setopt_array($ch, $curlOpts);
+        // [CORREÇÃO ROBUSTEZ 4] Retry com exponential backoff para erros transitórios
+        $attempt  = 0;
+        $lastCode = 0;
+        $decoded  = [];
 
-        $responseBody = curl_exec($ch);
-        $httpCode     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlErr      = curl_errno($ch);
-        curl_close($ch);
+        while ($attempt < self::MAX_RETRY_ATTEMPTS) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, $curlOpts);
 
-        if ($curlErr) {
-            throw new GatewayException('BofA API: cURL error — ' . curl_strerror($curlErr));
+            $responseBody = curl_exec($ch);
+            $httpCode     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErr      = curl_errno($ch);
+            curl_close($ch);
+
+            if ($curlErr) {
+                throw new GatewayException('BofA API: cURL error — ' . curl_strerror($curlErr));
+            }
+
+            $decoded  = json_decode($responseBody, true) ?? [];
+            $lastCode = $httpCode;
+
+            // Erros transitórios: aguardar e tentar novamente
+            if (in_array($httpCode, [429, 503], true) && $attempt < self::MAX_RETRY_ATTEMPTS - 1) {
+                $attempt++;
+                // Exponential backoff: 500ms, 1000ms
+                usleep(500_000 * $attempt);
+                continue;
+            }
+
+            break;
         }
 
-        $decoded = json_decode($responseBody, true) ?? [];
-
-        if ($httpCode >= 400) {
+        if ($lastCode >= 400) {
             throw new GatewayException(
                 'BofA API error: ' . ($decoded['message'] ?? $decoded['error'] ?? 'unknown'),
-                $httpCode,
+                $lastCode,
                 null,
                 ['endpoint' => $endpoint, 'response' => $decoded]
             );
         }
 
         return $decoded;
+    }
+
+    // ==========================================================
+    //  VALIDAÇÕES PRIVADAS
+    // ==========================================================
+
+    /**
+     * Valida o valor da transferência.
+     *
+     * @throws GatewayException Se o valor for zero ou negativo.
+     */
+    private function assertPositiveAmount(float $amount): void
+    {
+        if ($amount <= 0) {
+            throw new GatewayException(
+                "Transfer amount must be greater than zero. Got: {$amount}"
+            );
+        }
+    }
+
+    /**
+     * Valida o ABA routing number usando o algoritmo de dígito verificador padrão.
+     *
+     * O routing number tem exatamente 9 dígitos. O nono dígito é um checksum
+     * calculado com pesos 3, 7, 1 sobre os dígitos anteriores.
+     *
+     * [CORREÇÃO CRÍTICA 2] Previne envio de transferências com routing inválido,
+     * o que causaria rejeição pelo banco receptor (ACH) ou perda de fundos (Wire).
+     *
+     * @throws GatewayException Se o routing number for inválido.
+     */
+    private function validateRoutingNumber(string $routing): void
+    {
+        if (!preg_match('/^\d{9}$/', $routing)) {
+            throw new GatewayException(
+                "Invalid routing number: must be exactly 9 digits. Got: '{$routing}'"
+            );
+        }
+
+        $d = array_map('intval', str_split($routing));
+
+        $checksum = (
+            3 * ($d[0] + $d[3] + $d[6]) +
+            7 * ($d[1] + $d[4] + $d[7]) +
+            1 * ($d[2] + $d[5] + $d[8])
+        ) % 10;
+
+        if ($checksum !== 0) {
+            throw new GatewayException(
+                "Invalid routing number: ABA checksum failed for '{$routing}'. " .
+                'Verify the routing number with the recipient bank.'
+            );
+        }
+    }
+
+    /**
+     * Valida o telefone no formato E.164 exigido pelo Zelle.
+     *
+     * Formato: +{código do país}{número} — sem espaços, parênteses ou hifens.
+     * Exemplos válidos: +15555551234, +5511999998888
+     *
+     * [CORREÇÃO MELHORIA 4] Previne envio de Zelle com telefone mal formatado,
+     * o que resultaria em erro da API ou entrega para destinatário errado.
+     *
+     * @throws GatewayException Se o telefone não estiver no formato E.164.
+     */
+    private function validateE164Phone(string $phone): void
+    {
+        if (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+            throw new GatewayException(
+                "Invalid phone number format: must be E.164 (e.g., +15555551234). Got: '{$phone}'"
+            );
+        }
+    }
+
+    /**
+     * Valida que a effectiveDate é uma data futura no formato YYYY-MM-DD.
+     *
+     * [CORREÇÃO MELHORIA 2] Previne envio ao BofA de datas no passado,
+     * o que causaria rejeição com mensagem de erro genérica.
+     *
+     * @throws GatewayException Se a data for inválida ou não for futura.
+     */
+    private function validateFutureDate(string $date): void
+    {
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+            throw new GatewayException(
+                "Invalid date format: must be YYYY-MM-DD. Got: '{$date}'"
+            );
+        }
+
+        $ts = strtotime($date);
+        if ($ts === false) {
+            throw new GatewayException("Invalid date: '{$date}' is not a valid calendar date.");
+        }
+
+        if ($ts < strtotime('today')) {
+            throw new GatewayException(
+                "effectiveDate must be today or a future date. Got: '{$date}'"
+            );
+        }
+    }
+
+    /**
+     * Remove campos null do payload sem remover zeros ou booleans falsos.
+     *
+     * [CORREÇÃO ROBUSTEZ 2] Substitui array_filter() puro que removia
+     * valores falsy legítimos como 0, 0.0, false e strings vazias intencionais.
+     *
+     * @param array $payload Array com possíveis valores null.
+     * @return array Array sem chaves null.
+     */
+    private function cleanPayload(array $payload): array
+    {
+        return array_filter($payload, fn($v) => $v !== null);
+    }
+
+    /**
+     * Mascara dados bancários sensíveis no rawResponse antes de retornar ao chamador.
+     *
+     * [CORREÇÃO MELHORIA 3] Previne exposição de routing numbers e account numbers
+     * completos em logs, banco de dados ou respostas de API.
+     *
+     * @param array $response Resposta bruta da API do BofA.
+     * @return array Resposta com campos sensíveis mascarados.
+     */
+    private function maskSensitiveData(array $response): array
+    {
+        // Mascara account numbers: mantém apenas os 4 últimos dígitos
+        foreach (['recipientAccount', 'beneficiaryAccount', 'accountNumber'] as $field) {
+            if (isset($response[$field]) && strlen((string) $response[$field]) > 4) {
+                $response[$field] = '***' . substr((string) $response[$field], -4);
+            }
+        }
+
+        // Remove routing numbers do response (são públicos, mas desnecessários nos logs)
+        unset($response['recipientRouting'], $response['beneficiaryRouting']);
+
+        return $response;
     }
 
     // ==========================================================
@@ -364,41 +553,18 @@ class BofACashProGateway implements PaymentGatewayInterface
      *  ACH:   routingNumber + accountNumber + accountType + recipientName (via metadata)
      *  Wire:  routingNumber + accountNumber + recipientName + bankName (via metadata)
      *
-     * EXEMPLO DE USO:
-     * ---------------
-     *   // Saque de $500 — vai via Zelle automaticamente
-     *   $request = TransferRequest::create(
-     *       amount: 500.00,
-     *       recipientName: 'John Doe',
-     *       description: 'Saque #12345',
-     *       metadata: [
-     *           'recipientEmail' => 'john@example.com',
-     *           'memo'           => 'Withdrawal REF-12345',
-     *       ]
-     *   );
-     *
-     *   // Saque de $15.000 — vai via ACH automaticamente
-     *   $request = TransferRequest::create(
-     *       amount: 15000.00,
-     *       recipientName: 'Jane Doe',
-     *       description: 'Saque #67890',
-     *       metadata: [
-     *           'routingNumber'  => '021000021',
-     *           'accountNumber'  => '123456789',
-     *           'accountType'    => 'checking',
-     *           'memo'           => 'Withdrawal REF-67890',
-     *       ]
-     *   );
-     *
      * @param TransferRequest $request DTO de transferência do PaymentHub.
      * @return TransferResponse Resultado da transferência com ID, status e método usado.
      *
+     * @throws GatewayException Se o valor for zero ou negativo.
      * @throws GatewayException Se o método roteado não tiver os dados necessários.
      * @throws GatewayException Se a API do BofA retornar erro.
      */
     public function transfer(TransferRequest $request): TransferResponse
     {
         $amount = $request->getAmount();
+
+        $this->assertPositiveAmount($amount);
 
         return match (true) {
             $amount <= $this->zelleThreshold => $this->sendZelle($request),
@@ -433,20 +599,18 @@ class BofACashProGateway implements PaymentGatewayInterface
      *                   IMPORTANTE: Use este campo para identificar o cliente
      *                   dentro da sua plataforma (ex: "REF-USER-7890").
      *
-     * LIMITAÇÕES
-     * ----------
-     * - Limite por transação: negociado diretamente com o BofA no onboarding.
-     * - Destinatário sem Zelle ativo receberá um convite por e-mail/SMS do Zelle.
-     *   O dinheiro fica retido por 14 dias; se não aceito, é devolvido.
-     *
      * @param TransferRequest $request DTO com amount (USD) e metadata com email/phone.
      * @return TransferResponse Com transferId, status 'processing' e method='zelle'.
      *
+     * @throws GatewayException Se o valor for zero ou negativo.
      * @throws GatewayException Se nem email nem telefone forem informados no metadata.
-     * @throws GatewayException Se a API retornar erro (destinatário inválido, limite excedido, etc.).
+     * @throws GatewayException Se o telefone não estiver no formato E.164.
+     * @throws GatewayException Se a API retornar erro.
      */
     public function sendZelle(TransferRequest $request): TransferResponse
     {
+        $this->assertPositiveAmount($request->getAmount());
+
         $meta  = $request->metadata ?? [];
         $email = $meta['recipientEmail'] ?? null;
         $phone = $meta['recipientPhone'] ?? null;
@@ -457,7 +621,12 @@ class BofACashProGateway implements PaymentGatewayInterface
             );
         }
 
-        $payload = array_filter([
+        // [CORREÇÃO MELHORIA 4] Valida formato E.164 antes de enviar ao BofA
+        if ($phone) {
+            $this->validateE164Phone($phone);
+        }
+
+        $payload = $this->cleanPayload([
             'paymentType'       => 'ZELLE',
             'amount'            => $request->getAmount(),
             'currency'          => 'USD',
@@ -471,6 +640,9 @@ class BofACashProGateway implements PaymentGatewayInterface
 
         $response = $this->request('POST', '/payments/zelle', $payload);
 
+        // [CORREÇÃO MELHORIA 3] Mascara dados sensíveis no rawResponse
+        $safeResponse = $this->maskSensitiveData($response);
+
         return TransferResponse::create(
             success:     true,
             transferId:  $response['paymentId'] ?? $response['id'],
@@ -478,7 +650,7 @@ class BofACashProGateway implements PaymentGatewayInterface
             status:      strtolower($response['status'] ?? 'processing'),
             currency:    'USD',
             message:     'Zelle transfer initiated successfully',
-            rawResponse: array_merge($response, ['_method' => 'zelle']),
+            rawResponse: array_merge($safeResponse, ['_method' => 'zelle']),
         );
     }
 
@@ -500,15 +672,15 @@ class BofACashProGateway implements PaymentGatewayInterface
      * - Requer dados bancários completos do destinatário (routing + account).
      *
      * CAMPOS OBRIGATÓRIOS via $request->metadata:
-     *   'routingNumber'  string  Routing number do banco do destinatário (9 dígitos).
+     *   'routingNumber'  string  Routing number do banco do destinatário (9 dígitos, validado com checksum ABA).
      *   'accountNumber'  string  Número da conta bancária do destinatário.
      *   'accountType'    string  Tipo da conta: 'checking' ou 'savings'.
      *
      * CAMPOS OPCIONAIS via $request->metadata:
-     *   'sameDay'        bool    true = Same-Day ACH (padrão: true para maior velocidade).
-     *   'effectiveDate'  string  Data de liquidação no formato YYYY-MM-DD.
-     *                            Ignorado se sameDay = true.
-     *   'memo'           string  Descrição da transferência (aparece no extrato).
+     *   'sameDay'          bool    true = Same-Day ACH (padrão: true para maior velocidade).
+     *   'effectiveDate'    string  Data de liquidação no formato YYYY-MM-DD (deve ser futura).
+     *                              Ignorado se sameDay = true.
+     *   'memo'             string  Descrição da transferência (aparece no extrato).
      *   'companyEntryDesc' string  Identificador do remetente (até 10 chars) exibido no extrato do destinatário.
      *
      * SOBRE O CUTOFF SAME-DAY ACH
@@ -521,11 +693,16 @@ class BofACashProGateway implements PaymentGatewayInterface
      * @param TransferRequest $request DTO com amount (USD) e metadata com dados bancários.
      * @return TransferResponse Com transferId, status e method='ach'.
      *
+     * @throws GatewayException Se o valor for zero ou negativo.
      * @throws GatewayException Se routingNumber, accountNumber ou accountType não forem informados.
-     * @throws GatewayException Se a API retornar erro (routing inválido, conta encerrada, etc.).
+     * @throws GatewayException Se o routing number falhar no checksum ABA.
+     * @throws GatewayException Se effectiveDate for inválida ou no passado.
+     * @throws GatewayException Se a API retornar erro.
      */
     public function sendACH(TransferRequest $request): TransferResponse
     {
+        $this->assertPositiveAmount($request->getAmount());
+
         $meta = $request->metadata ?? [];
 
         foreach (['routingNumber', 'accountNumber', 'accountType'] as $required) {
@@ -536,9 +713,19 @@ class BofACashProGateway implements PaymentGatewayInterface
             }
         }
 
+        // [CORREÇÃO CRÍTICA 2] Valida routing number com dígito verificador ABA
+        $this->validateRoutingNumber($meta['routingNumber']);
+
         $sameDay = $meta['sameDay'] ?? true;
 
-        $payload = array_filter([
+        // [CORREÇÃO MELHORIA 2] Valida effectiveDate antes de enviar
+        $effectiveDate = null;
+        if (!$sameDay && !empty($meta['effectiveDate'])) {
+            $this->validateFutureDate($meta['effectiveDate']);
+            $effectiveDate = $meta['effectiveDate'];
+        }
+
+        $payload = $this->cleanPayload([
             'paymentType'          => $sameDay ? 'ACH_SAME_DAY' : 'ACH_STANDARD',
             'amount'               => $request->getAmount(),
             'currency'             => 'USD',
@@ -547,13 +734,16 @@ class BofACashProGateway implements PaymentGatewayInterface
             'recipientRouting'     => $meta['routingNumber'],
             'recipientAccount'     => $meta['accountNumber'],
             'recipientAccountType' => strtoupper($meta['accountType']), // CHECKING | SAVINGS
-            'effectiveDate'        => !$sameDay ? ($meta['effectiveDate'] ?? null) : null,
+            'effectiveDate'        => $effectiveDate,
             'memo'                 => $meta['memo'] ?? $request->description,
             'companyEntryDesc'     => substr($meta['companyEntryDesc'] ?? 'PAYMENTHUB', 0, 10),
             'clientReferenceId'    => $this->generateRequestId(),
         ]);
 
         $response = $this->request('POST', '/payments/ach', $payload);
+
+        // [CORREÇÃO MELHORIA 3] Mascara dados sensíveis no rawResponse
+        $safeResponse = $this->maskSensitiveData($response);
 
         return TransferResponse::create(
             success:     true,
@@ -562,7 +752,7 @@ class BofACashProGateway implements PaymentGatewayInterface
             status:      strtolower($response['status'] ?? 'processing'),
             currency:    'USD',
             message:     ($sameDay ? 'Same-Day' : 'Standard') . ' ACH transfer initiated',
-            rawResponse: array_merge($response, ['_method' => 'ach', '_sameDay' => $sameDay]),
+            rawResponse: array_merge($safeResponse, ['_method' => 'ach', '_sameDay' => $sameDay]),
         );
     }
 
@@ -584,34 +774,31 @@ class BofACashProGateway implements PaymentGatewayInterface
      * - Ideal para valores acima de $50.000.
      *
      * CAMPOS OBRIGATÓRIOS via $request->metadata:
-     *   'routingNumber'   string  ABA routing number do banco receptor (9 dígitos).
+     *   'routingNumber'   string  ABA routing number do banco receptor (9 dígitos, validado com checksum).
      *   'accountNumber'   string  Número da conta bancária do destinatário.
      *   'bankName'        string  Nome do banco receptor.
      *
      * CAMPOS OPCIONAIS via $request->metadata:
      *   'bankAddress'     string  Endereço do banco receptor (exigido por alguns bancos).
      *   'memo'            string  OBI (Originator to Beneficiary Information) — até 140 chars.
-     *                             Aparece no extrato do destinatário. Use para identificar o cliente.
      *
      * CUTOFF FEDWIRE
      * --------------
      * O Fedwire opera das 21h ET (domingo) às 18h30 ET (sexta).
      * BofA geralmente tem cutoff interno às 17h ET.
-     * Wires recebidos após o cutoff são processados no próximo dia útil.
-     *
-     * WIRE INTERNACIONAL (SWIFT)
-     * --------------------------
-     * Para pagamentos internacionais, use o método sendSwiftWire() (não implementado nesta versão).
-     * Requer: SWIFT/BIC code, IBAN ou account number, e potencialmente um banco intermediário.
      *
      * @param TransferRequest $request DTO com amount (USD) e metadata com dados bancários.
      * @return TransferResponse Com transferId, status e method='wire'.
      *
+     * @throws GatewayException Se o valor for zero ou negativo.
      * @throws GatewayException Se routingNumber, accountNumber ou bankName não forem informados.
-     * @throws GatewayException Se a API retornar erro (routing inválido, cutoff ultrapassado, etc.).
+     * @throws GatewayException Se o routing number falhar no checksum ABA.
+     * @throws GatewayException Se a API retornar erro.
      */
     public function sendWire(TransferRequest $request): TransferResponse
     {
+        $this->assertPositiveAmount($request->getAmount());
+
         $meta = $request->metadata ?? [];
 
         foreach (['routingNumber', 'accountNumber', 'bankName'] as $required) {
@@ -622,22 +809,28 @@ class BofACashProGateway implements PaymentGatewayInterface
             }
         }
 
-        $payload = array_filter([
-            'paymentType'       => 'WIRE',
-            'amount'            => $request->getAmount(),
-            'currency'          => 'USD',
-            'debitAccountId'    => $this->accountId,
-            'beneficiaryName'   => $request->recipientName,
-            'beneficiaryRouting'=> $meta['routingNumber'],
-            'beneficiaryAccount'=> $meta['accountNumber'],
-            'beneficiaryBank'   => $meta['bankName'],
+        // [CORREÇÃO CRÍTICA 2] Valida routing number com dígito verificador ABA
+        $this->validateRoutingNumber($meta['routingNumber']);
+
+        $payload = $this->cleanPayload([
+            'paymentType'            => 'WIRE',
+            'amount'                 => $request->getAmount(),
+            'currency'               => 'USD',
+            'debitAccountId'         => $this->accountId,
+            'beneficiaryName'        => $request->recipientName,
+            'beneficiaryRouting'     => $meta['routingNumber'],
+            'beneficiaryAccount'     => $meta['accountNumber'],
+            'beneficiaryBank'        => $meta['bankName'],
             'beneficiaryBankAddress' => $meta['bankAddress'] ?? null,
             // OBI: mensagem que aparece no extrato do destinatário (Originator to Beneficiary Info)
-            'obi'               => substr($meta['memo'] ?? $request->description ?? '', 0, 140),
-            'clientReferenceId' => $this->generateRequestId(),
+            'obi'                    => substr($meta['memo'] ?? $request->description ?? '', 0, 140),
+            'clientReferenceId'      => $this->generateRequestId(),
         ]);
 
         $response = $this->request('POST', '/payments/wire', $payload);
+
+        // [CORREÇÃO MELHORIA 3] Mascara dados sensíveis no rawResponse
+        $safeResponse = $this->maskSensitiveData($response);
 
         return TransferResponse::create(
             success:     true,
@@ -646,7 +839,7 @@ class BofACashProGateway implements PaymentGatewayInterface
             status:      strtolower($response['status'] ?? 'processing'),
             currency:    'USD',
             message:     'Wire transfer initiated successfully',
-            rawResponse: array_merge($response, ['_method' => 'wire']),
+            rawResponse: array_merge($safeResponse, ['_method' => 'wire']),
         );
     }
 
@@ -663,11 +856,8 @@ class BofACashProGateway implements PaymentGatewayInterface
      * - Zelle: NÃO suporta agendamento — é sempre instantâneo.
      * - Wire: NÃO suporta agendamento via API — use o CashPro Online para agendamentos manuais.
      *
-     * O método determina automaticamente o tipo de transferência pelo valor e
-     * injeta a effectiveDate no metadata antes de chamar sendACH().
-     *
      * @param TransferRequest $request DTO de transferência.
-     * @param string          $date    Data de liquidação no formato YYYY-MM-DD.
+     * @param string          $date    Data de liquidação no formato YYYY-MM-DD (deve ser futura).
      * @return TransferResponse Com status 'scheduled'.
      *
      * @throws GatewayException Se o valor exceder o threshold do ACH (Wire não suporta agendamento).
@@ -683,25 +873,29 @@ class BofACashProGateway implements PaymentGatewayInterface
             );
         }
 
+        // [CORREÇÃO MELHORIA 2] Valida a data antes de montar o request
+        $this->validateFutureDate($date);
+
         // Injeta effectiveDate e desativa same-day para forçar ACH Standard agendado
         $scheduledMetadata = array_merge($request->metadata ?? [], [
             'sameDay'       => false,
             'effectiveDate' => $date,
         ]);
 
-        // Cria um novo request com o metadata atualizado (TransferRequest é imutável)
+        // [CORREÇÃO ROBUSTEZ 3] Criamos um novo request clonando o original com metadata atualizado.
+        // Se o TransferRequest ganhar novos campos obrigatórios, este ponto precisará de atualização.
         $scheduledRequest = new TransferRequest(
-            money:         $request->money,
-            recipientId:   $request->recipientId,
-            bankCode:      $request->bankCode,
-            agencyNumber:  $request->agencyNumber,
-            accountNumber: $request->accountNumber,
-            accountType:   $request->accountType,
-            documentNumber:$request->documentNumber,
-            recipientName: $request->recipientName,
-            pixKey:        $request->pixKey,
-            description:   $request->description,
-            metadata:      $scheduledMetadata,
+            money:          $request->money,
+            recipientId:    $request->recipientId,
+            bankCode:       $request->bankCode,
+            agencyNumber:   $request->agencyNumber,
+            accountNumber:  $request->accountNumber,
+            accountType:    $request->accountType,
+            documentNumber: $request->documentNumber,
+            recipientName:  $request->recipientName,
+            pixKey:         $request->pixKey,
+            description:    $request->description,
+            metadata:       $scheduledMetadata,
         );
 
         return $this->sendACH($scheduledRequest);
@@ -714,9 +908,7 @@ class BofACashProGateway implements PaymentGatewayInterface
      * ----------------------
      * - ACH Same-Day: janela muito curta (minutos). Use apenas se acabou de enviar.
      * - ACH Standard: pode ser cancelado até o início do processamento na data de liquidação.
-     * - Zelle/Wire: IRREVERSÍVEIS — esta chamada lançará exceção nesses casos.
-     *
-     * O BofA retorna erro se o pagamento já foi liquidado ou está em processamento final.
+     * - Zelle/Wire: IRREVERSÍVEIS — o BofA retornará erro para esses tipos.
      *
      * @param string $transferId  ID retornado no campo transferId do TransferResponse original.
      * @return TransferResponse Com status 'cancelled'.
@@ -755,7 +947,7 @@ class BofACashProGateway implements PaymentGatewayInterface
      *   CANCELLED   → Cancelado antes da liquidação.
      *   RETURNED    → ACH devolvido pelo banco receptor (conta encerrada, etc.).
      *
-     * @param string $transactionId  Payment ID retornado no TransferResponse ou PaymentResponse.
+     * @param string $transactionId  Payment ID retornado no TransferResponse.
      * @return TransactionStatusResponse Com status, timestamps e dados do pagamento.
      *
      * @throws GatewayException Se o transactionId não existir.
@@ -770,7 +962,7 @@ class BofACashProGateway implements PaymentGatewayInterface
             status:        strtolower($response['status'] ?? 'pending'),
             amount:        isset($response['amount']) ? (float) $response['amount'] : null,
             currency:      'USD',
-            rawResponse:   $response,
+            rawResponse:   $this->maskSensitiveData($response),
         );
     }
 
@@ -781,48 +973,39 @@ class BofACashProGateway implements PaymentGatewayInterface
      * -----------------------------------
      *   'startDate'    string  Data inicial no formato YYYY-MM-DD.
      *   'endDate'      string  Data final no formato YYYY-MM-DD.
-     *   'paymentType'  string  Filtrar por tipo: ZELLE, ACH_SAME_DAY, ACH_STANDARD, WIRE.
-     *   'status'       string  Filtrar por status: PENDING, COMPLETED, FAILED, etc.
-     *   'minAmount'    float   Valor mínimo da transação.
-     *   'maxAmount'    float   Valor máximo da transação.
-     *   'page'         int     Número da página (paginação, padrão: 1).
-     *   'pageSize'     int     Itens por página (padrão: 50, máximo: 500).
+     *   'paymentType'  string  'ZELLE' | 'ACH_SAME_DAY' | 'ACH_STANDARD' | 'WIRE'
+     *   'status'       string  'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'RETURNED'
+     *   'page'         int     Número da página (paginação, default: 1).
+     *   'pageSize'     int     Resultados por página (default: 50, max: 500).
      *
-     * USO PRINCIPAL NA FINTECH
-     * ------------------------
-     * Listar transações é o mecanismo de fallback para reconciliação quando
-     * um webhook não foi recebido. Comparar com registros internos para
-     * identificar Zelles recebidos não processados.
-     *
-     * @param array $filters Filtros opcionais conforme documentado acima.
-     * @return array Lista de transações. Cada item segue o formato da CashPro API.
-     *
-     * @throws GatewayException Se os filtros de data forem inválidos.
+     * @param array $filters Filtros opcionais.
+     * @return array Lista de transações no formato bruto da API do BofA.
      */
     public function listTransactions(array $filters = []): array
     {
-        $query = array_filter(array_merge([
-            'accountId' => $this->accountId,
-        ], $filters));
+        $query = array_merge(['accountId' => $this->accountId], $filters);
 
-        return $this->request('GET', '/accounts/transactions', query: $query);
+        $response = $this->request('GET', '/payments', query: $query);
+
+        // Retorna o array de transações da resposta paginada
+        return $response['payments'] ?? $response['data'] ?? $response;
     }
 
+    // ==========================================================
+    //  SALDO
+    // ==========================================================
+
     /**
-     * Consulta o saldo disponível e contábil da conta corporativa.
+     * Consulta o saldo atual da conta corporativa BofA.
      *
-     * TIPOS DE SALDO
-     * --------------
-     *   availableBalance → Saldo disponível para uso imediato (após retenções e saques pendentes).
-     *   ledgerBalance    → Saldo contábil total (pode incluir depósitos ainda não liberados).
-     *   openingBalance   → Saldo no início do dia útil corrente.
+     * CAMPOS DO RESPONSE
+     * ------------------
+     *   availableBalance → Saldo disponível para uso imediato.
+     *   balance          → Saldo contábil total (incluindo fundos pendentes).
+     *   pendingBalance   → Diferença entre contábil e disponível (em processamento).
+     *   currency         → Sempre 'USD'.
      *
-     * FREQUÊNCIA RECOMENDADA
-     * ----------------------
-     * Não consulte saldo em loop — use Push Notifications para monitoramento em tempo real.
-     * Consulta pontual antes de autorizar saques grandes é uma boa prática.
-     *
-     * @return BalanceResponse Com availableBalance, ledgerBalance e currency (USD).
+     * @return BalanceResponse Com saldos disponível, contábil e pendente.
      *
      * @throws GatewayException Se a conta não for encontrada ou o token não tiver permissão.
      */
@@ -832,9 +1015,9 @@ class BofACashProGateway implements PaymentGatewayInterface
 
         return new BalanceResponse(
             success:          true,
-            balance:          $response['ledgerBalance']    ?? 0.0,
-            availableBalance: $response['availableBalance'] ?? 0.0,
-            pendingBalance:   ($response['ledgerBalance'] ?? 0.0) - ($response['availableBalance'] ?? 0.0),
+            balance:          (float) ($response['ledgerBalance']    ?? 0.0),
+            availableBalance: (float) ($response['availableBalance'] ?? 0.0),
+            pendingBalance:   (float) ($response['ledgerBalance'] ?? 0.0) - (float) ($response['availableBalance'] ?? 0.0),
             currency:         $response['currency'] ?? 'USD',
             rawResponse:      $response,
         );
@@ -847,43 +1030,24 @@ class BofACashProGateway implements PaymentGatewayInterface
     /**
      * Registra uma URL de webhook para receber eventos em tempo real.
      *
-     * SOBRE OS PUSH NOTIFICATIONS DO CASHPRO
-     * ----------------------------------------
-     * Em vez de polling (consultar status repetidamente), o BofA envia
-     * notificações HTTP POST para sua URL quando eventos ocorrem.
-     *
      * EVENTOS DISPONÍVEIS
      * --------------------
-     *   PAYMENT_SENT          → Pagamento enviado confirmado (Zelle, ACH, Wire).
-     *   PAYMENT_RECEIVED      → Pagamento recebido na conta (Zelle creditado).
-     *   PAYMENT_FAILED        → Pagamento falhou.
-     *   PAYMENT_RETURNED      → ACH devolvido pelo banco receptor.
-     *   BALANCE_BELOW_THRESHOLD → Saldo abaixo do limite configurado.
-     *   STATEMENT_AVAILABLE   → Extrato mensal disponível.
+     *   PAYMENT_SENT              → Pagamento enviado confirmado (Zelle, ACH, Wire).
+     *   PAYMENT_RECEIVED          → Pagamento recebido na conta.
+     *   PAYMENT_FAILED            → Pagamento falhou.
+     *   PAYMENT_RETURNED          → ACH devolvido pelo banco receptor.
+     *   BALANCE_BELOW_THRESHOLD   → Saldo abaixo do limite configurado.
+     *   STATEMENT_AVAILABLE       → Extrato mensal disponível.
      *
-     * PAYLOAD TÍPICO DE PAYMENT_RECEIVED (Zelle):
-     * ---------------------------------------------
-     *   {
-     *     "eventType":    "PAYMENT_RECEIVED",
-     *     "timestamp":    "2025-02-27T15:30:00Z",
-     *     "paymentId":    "PAY-123456",
-     *     "paymentType":  "ZELLE",
-     *     "amount":       250.00,
-     *     "currency":     "USD",
-     *     "senderEmail":  "cliente@email.com",
-     *     "memo":         "REF-USER-7890",
-     *     "accountId":    "87654321"
-     *   }
-     *
-     * SEGURANÇA DO WEBHOOK
-     * ---------------------
+     * SEGURANÇA
+     * ----------
      * O BofA assina os payloads com HMAC-SHA256 usando uma chave secreta
      * configurada no portal. Valide sempre a assinatura antes de processar.
+     * Use BofACashProWebhookHandler com webhookSecret obrigatório.
      * Header de assinatura: X-BofA-Signature
      *
      * @param string $url    URL HTTPS pública que receberá os eventos.
-     * @param array  $events Lista de tipos de evento. Veja lista acima.
-     *                       Exemplo: ['PAYMENT_RECEIVED', 'PAYMENT_FAILED']
+     * @param array  $events Lista de tipos de evento.
      *
      * @return array Array com 'webhookId' e 'status' do registro.
      *
@@ -968,13 +1132,13 @@ class BofACashProGateway implements PaymentGatewayInterface
         throw new GatewayException('PIX is not supported by BofA CashPro. Use a Brazilian gateway (Asaas, PagarMe, C6Bank, etc.).');
     }
 
-    /** @throws GatewayException Sempre — BofA não retorna QR Code PIX. */
+    /** @throws GatewayException Sempre */
     public function getPixQrCode(string $transactionId): string
     {
         throw new GatewayException('PIX is not supported by BofA CashPro.');
     }
 
-    /** @throws GatewayException Sempre — BofA não retorna código copia e cola PIX. */
+    /** @throws GatewayException Sempre */
     public function getPixCopyPaste(string $transactionId): string
     {
         throw new GatewayException('PIX is not supported by BofA CashPro.');
@@ -1010,7 +1174,7 @@ class BofACashProGateway implements PaymentGatewayInterface
         throw new GatewayException('Debit card payments are not supported by BofA CashPro.');
     }
 
-    /** @throws GatewayException Sempre — Boleto é produto separado no BofA (integração específica para Brasil). */
+    /** @throws GatewayException Sempre — Boleto é produto separado no BofA. */
     public function createBoleto(BoletoPaymentRequest $request): PaymentResponse
     {
         throw new GatewayException('Boleto is not supported via CashPro API. Use a Brazilian gateway.');
@@ -1058,7 +1222,7 @@ class BofACashProGateway implements PaymentGatewayInterface
         throw new GatewayException('Subscriptions are not supported by BofA CashPro.');
     }
 
-    /** @throws GatewayException Sempre — Wire/Zelle são irreversíveis. ACH pode ser cancelado via cancelScheduledTransfer(). */
+    /** @throws GatewayException Sempre — Wire/Zelle são irreversíveis. ACH: use cancelScheduledTransfer(). */
     public function refund(RefundRequest $request): RefundResponse
     {
         throw new GatewayException('Refunds are not supported by BofA CashPro. Zelle and Wire are irreversible. For ACH, use cancelScheduledTransfer() before settlement.');
@@ -1088,15 +1252,7 @@ class BofACashProGateway implements PaymentGatewayInterface
         throw new GatewayException('Split payments are not supported by BofA CashPro. Implement at the application layer using multiple transfer() calls.');
     }
 
-    /**
-     * Sub-contas via VAM (Virtual Account Management).
-     *
-     * O BofA suporta VAM para tesouraria corporativa, mas NÃO cria contas
-     * por usuário final (modelo fintech/marketplace).
-     * Gerencie sub-contas/wallets de usuários finais na camada de aplicação.
-     *
-     * @throws GatewayException Sempre.
-     */
+    /** @throws GatewayException Sempre */
     public function createSubAccount(SubAccountRequest $request): SubAccountResponse
     {
         throw new GatewayException('Per-user sub-accounts are not supported by BofA CashPro. Manage user balances via Wallet at the application layer.');
@@ -1258,13 +1414,16 @@ class BofACashProGateway implements PaymentGatewayInterface
      *   1. Idempotência — rejeitar duplicatas com o mesmo ID em curto período.
      *   2. Rastreamento — localizar o request nos logs do BofA (suporte técnico).
      *
-     * Formato: cashpro-{timestamp em hex}-{random hex}
-     * Exemplo: cashpro-67c09e2a-5f3a4b8c
+     * [CORREÇÃO MELHORIA 5] Usa 8 bytes (64 bits) de entropia em vez de 4 bytes (32 bits).
+     * A probabilidade de colisão com 64 bits é astronomicamente baixa mesmo em alto volume.
+     *
+     * Formato: cashpro-{timestamp em hex}-{random 16 hex chars}
+     * Exemplo: cashpro-67c09e2a-5f3a4b8c1d2e3f4a
      *
      * @return string ID único com prefixo 'cashpro-'.
      */
     private function generateRequestId(): string
     {
-        return 'cashpro-' . dechex(time()) . '-' . bin2hex(random_bytes(4));
+        return 'cashpro-' . dechex(time()) . '-' . bin2hex(random_bytes(8));
     }
 }

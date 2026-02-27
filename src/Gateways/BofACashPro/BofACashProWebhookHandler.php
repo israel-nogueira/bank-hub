@@ -11,47 +11,35 @@ use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
  *  Bank of America — CashPro Webhook Handler
  * ============================================================
  *
- *  Processa eventos Push Notification recebidos do BofA CashPro.
+ *  Processa notificações push (webhooks) enviadas pelo BofA
+ *  quando eventos ocorrem na conta CashPro.
  *
- *  O BofA envia um HTTP POST para sua URL cadastrada sempre que
- *  um evento ocorre na conta (pagamento recebido, enviado, falhou, etc.).
- *  Esta classe é responsável por:
- *
- *    1. Validar a assinatura HMAC-SHA256 do payload
- *    2. Parsear e normalizar o evento
- *    3. Despachar para o handler correto via callbacks registrados
- *    4. Responder 200 OK ao BofA (necessário para evitar reenvios)
- *
- *  EVENTOS SUPORTADOS
- *  ------------------
- *  | Evento                  | Quando ocorre                          |
- *  |-------------------------|----------------------------------------|
- *  | PAYMENT_RECEIVED        | Zelle/ACH/Wire recebido na conta       |
- *  | PAYMENT_SENT            | Transferência enviada confirmada        |
- *  | PAYMENT_FAILED          | Transferência falhou                   |
- *  | PAYMENT_RETURNED        | ACH devolvido pelo banco receptor      |
- *  | PAYMENT_CANCELLED       | Transferência cancelada com sucesso    |
- *  | BALANCE_BELOW_THRESHOLD | Saldo abaixo do limite configurado     |
- *  | STATEMENT_AVAILABLE     | Extrato mensal disponível              |
- *
- *  SOBRE A ASSINATURA HMAC
+ *  FLUXO DE PROCESSAMENTO
  *  -----------------------
- *  O BofA assina cada payload com HMAC-SHA256 usando uma chave secreta
- *  que você configura no Developer Portal. A assinatura é enviada no
- *  header: X-BofA-Signature
+ *  1. Valida método HTTP (POST)
+ *  2. Valida IP de origem (opcional, recomendado em produção)
+ *  3. Lê o body bruto de php://input
+ *  4. Valida assinatura HMAC-SHA256 (obrigatório se webhookSecret configurado)
+ *  5. Parseia e normaliza o payload JSON
+ *  6. Despacha para o handler registrado via on()
  *
- *  Formato da assinatura: sha256={hash_hex}
- *  Exemplo: sha256=3ecb2e1a9f34...
+ *  RESPOSTA ESPERADA PELO BOFA
+ *  ----------------------------
+ *  O BofA espera HTTP 200 em até 10 segundos.
+ *  Se não receber, reenvia o evento (até 3 tentativas com backoff).
+ *  Use respondOk() logo após handle() e processe em background se necessário.
  *
- *  NUNCA processe um webhook sem validar a assinatura em produção.
- *
- *  IDEMPOTÊNCIA
- *  ------------
- *  O BofA pode reenviar o mesmo evento em caso de timeout ou falha
- *  de rede. Use o campo eventId para deduplicar eventos já processados.
+ *  SEGURANÇA (v1.1.0)
+ *  -------------------
+ *  - webhookSecret é OBRIGATÓRIO (não-nullable). Remover a validação HMAC
+ *    permite que qualquer pessoa simule eventos de pagamento.
+ *  - Em modo $strictSignature = false (apenas para desenvolvimento/testes),
+ *    a validação de assinatura é ignorada mas um E_USER_WARNING é emitido.
+ *  - Comparação de assinatura usa hash_equals() — resistente a timing attacks.
+ *  - Validação de IP como camada adicional (recomendada, opcional).
  *
  * @author  PaymentHub
- * @version 1.0.0
+ * @version 1.1.0
  */
 class BofACashProWebhookHandler
 {
@@ -59,46 +47,36 @@ class BofACashProWebhookHandler
     //  Constantes de eventos
     // ----------------------------------------------------------
 
-    /** Zelle, ACH ou Wire creditado na conta corporativa. Evento mais importante para a fintech. */
-    public const EVENT_PAYMENT_RECEIVED = 'PAYMENT_RECEIVED';
+    /** Zelle, ACH ou Wire creditado na conta corporativa. */
+    public const EVENT_PAYMENT_RECEIVED       = 'PAYMENT_RECEIVED';
 
-    /** Transferência debitada e confirmada pelo BofA (Zelle instantâneo, ACH/Wire na liquidação). */
-    public const EVENT_PAYMENT_SENT = 'PAYMENT_SENT';
+    /** Transferência enviada confirmada (Zelle/ACH/Wire). */
+    public const EVENT_PAYMENT_SENT           = 'PAYMENT_SENT';
 
-    /** Transferência falhou por qualquer motivo (conta inválida, limite, etc.). */
-    public const EVENT_PAYMENT_FAILED = 'PAYMENT_FAILED';
+    /** Transferência falhou por qualquer motivo. */
+    public const EVENT_PAYMENT_FAILED         = 'PAYMENT_FAILED';
 
-    /** ACH devolvido pelo banco receptor (conta encerrada, routing errado, etc.). */
-    public const EVENT_PAYMENT_RETURNED = 'PAYMENT_RETURNED';
+    /** ACH devolvido pelo banco receptor. */
+    public const EVENT_PAYMENT_RETURNED       = 'PAYMENT_RETURNED';
 
-    /** Transferência agendada cancelada com sucesso via cancelScheduledTransfer(). */
-    public const EVENT_PAYMENT_CANCELLED = 'PAYMENT_CANCELLED';
+    /** ACH cancelado antes da liquidação. */
+    public const EVENT_PAYMENT_CANCELLED      = 'PAYMENT_CANCELLED';
 
-    /** Saldo da conta caiu abaixo do threshold configurado no portal do BofA. */
+    /** Saldo da conta abaixo do limite configurado no portal BofA. */
     public const EVENT_BALANCE_BELOW_THRESHOLD = 'BALANCE_BELOW_THRESHOLD';
 
-    /** Novo extrato mensal disponível para download. */
-    public const EVENT_STATEMENT_AVAILABLE = 'STATEMENT_AVAILABLE';
+    /** Extrato mensal disponível para download. */
+    public const EVENT_STATEMENT_AVAILABLE    = 'STATEMENT_AVAILABLE';
 
     // ----------------------------------------------------------
     //  Estado interno
     // ----------------------------------------------------------
 
-    /**
-     * Mapa de eventType → callable.
-     * Populado via on() e onPaymentReceived() etc.
-     *
-     * @var array<string, callable>
-     */
+    /** @var array<string, callable> Handlers indexados por eventType. */
     private array $handlers = [];
 
-    /**
-     * Handler de fallback chamado para eventos sem handler registrado.
-     * Útil para logging de eventos não tratados.
-     *
-     * @var callable|null
-     */
-    private $fallbackHandler = null;
+    /** Callable invocado para eventos sem handler registrado. null = ignorar. */
+    private ?callable $fallbackHandler = null;
 
     // ----------------------------------------------------------
     //  Construtor
@@ -107,24 +85,56 @@ class BofACashProWebhookHandler
     /**
      * Instancia o handler de webhooks do BofA CashPro.
      *
-     * @param string|null $webhookSecret  Chave secreta configurada no Developer Portal
-     *                                    para validação HMAC-SHA256.
-     *                                    null = validação desativada (apenas para sandbox/testes).
-     * @param bool        $validateIp     Se true, valida que o IP do request pertence ao BofA.
-     *                                    Recomendado em produção combinado com HMAC.
-     * @param array       $allowedIps     Lista de IPs do BofA autorizados a enviar webhooks.
-     *                                    Consulte a documentação do BofA para a lista atualizada.
+     * [CORREÇÃO CRÍTICA 3] webhookSecret DEVE ser fornecido em produção.
+     * Se for null, a validação HMAC é DESABILITADA e um E_USER_WARNING é emitido.
+     * Nunca deixe webhookSecret = null em produção — qualquer IP poderia forjar
+     * eventos de pagamento e créditar saldos indevidos na sua plataforma.
      *
-     * Exemplo:
+     * @param string|null $webhookSecret  Chave HMAC configurada no BofA Developer Portal.
+     *                                    null = desabilita validação de assinatura (APENAS desenvolvimento).
+     * @param bool        $validateIp     Se true, rejeita requests de IPs fora de $allowedIps.
+     * @param array       $allowedIps     Lista de IPs do BofA. Consulte o Developer Portal para a lista atual.
+     * @param bool        $strictSignature Se true (padrão) e webhookSecret for null, lança GatewayException.
+     *                                     Se false, emite E_USER_WARNING e continua sem validação.
+     *
+     * Exemplo (produção):
      *   $handler = new BofACashProWebhookHandler(
-     *       webhookSecret: $_ENV['BOFA_WEBHOOK_SECRET'],
+     *       webhookSecret: $_ENV['BOFA_WEBHOOK_SECRET'], // obrigatório
      *   );
+     *
+     * Exemplo (desenvolvimento — NÃO use em produção):
+     *   $handler = new BofACashProWebhookHandler(
+     *       webhookSecret:   null,
+     *       strictSignature: false, // emite warning, não lança exceção
+     *   );
+     *
+     * @throws GatewayException Se webhookSecret for null e strictSignature for true (padrão).
      */
     public function __construct(
-        private readonly ?string $webhookSecret = null,
-        private readonly bool    $validateIp    = false,
-        private readonly array   $allowedIps    = [],
-    ) {}
+        private readonly ?string $webhookSecret  = null,
+        private readonly bool    $validateIp     = false,
+        private readonly array   $allowedIps     = [],
+        private readonly bool    $strictSignature = true,
+    ) {
+        // [CORREÇÃO CRÍTICA 3] Garante que produção não rode sem validação de assinatura
+        if ($this->webhookSecret === null) {
+            if ($this->strictSignature) {
+                throw new GatewayException(
+                    'BofACashProWebhookHandler: webhookSecret is required. ' .
+                    'Provide the HMAC secret configured in the BofA Developer Portal. ' .
+                    'To disable signature validation in development, set strictSignature = false ' .
+                    '(NEVER in production — it allows forged payment events).'
+                );
+            }
+
+            // Modo desenvolvimento: avisa mas não bloqueia
+            trigger_error(
+                'BofACashProWebhookHandler: webhookSecret not set. ' .
+                'Signature validation is DISABLED. This is a critical security risk in production.',
+                E_USER_WARNING
+            );
+        }
+    }
 
     // ==========================================================
     //  REGISTRO DE HANDLERS
@@ -155,7 +165,6 @@ class BofACashProWebhookHandler
     /**
      * Registra handler para o evento PAYMENT_RECEIVED.
      *
-     * Atalho semântico para on(EVENT_PAYMENT_RECEIVED, ...).
      * Este é o evento mais crítico para a fintech:
      * dispara quando um Zelle, ACH ou Wire é creditado na conta do BofA.
      *
@@ -173,9 +182,6 @@ class BofACashProWebhookHandler
      *   $event['senderPhone']  string   Telefone do remetente (Zelle). null para ACH/Wire.
      *   $event['senderName']   string   Nome do remetente (quando disponível).
      *   $event['memo']         string   Mensagem/memo enviada pelo remetente.
-     *                                   IMPORTANTE: Para Zelle, este campo contém o
-     *                                   identificador do cliente na sua plataforma
-     *                                   (ex: 'REF-USER-7890') se o cliente o informar.
      *   $event['rawPayload']   array    Payload bruto original do BofA.
      *
      * @param callable $handler  function(array $event): void
@@ -212,19 +218,17 @@ class BofACashProWebhookHandler
     /**
      * Registra handler para o evento PAYMENT_FAILED.
      *
-     * Dispara quando uma transferência falha por qualquer motivo.
-     *
      * CAUSAS COMUNS DE FALHA:
      *   - Zelle: destinatário não tem Zelle ativo, limite excedido
      *   - ACH: routing number inválido, conta encerrada, saldo insuficiente
      *   - Wire: dados bancários incorretos, cutoff ultrapassado
      *
      * ESTRUTURA DO $event:
-     *   $event['paymentId']    string   ID do pagamento que falhou.
-     *   $event['paymentType']  string   Método de pagamento.
-     *   $event['amount']       float    Valor que falhou.
-     *   $event['failureCode']  string   Código de erro do BofA.
-     *   $event['failureReason'] string  Descrição legível do motivo da falha.
+     *   $event['paymentId']     string   ID do pagamento que falhou.
+     *   $event['paymentType']   string   Método de pagamento.
+     *   $event['amount']        float    Valor que falhou.
+     *   $event['failureCode']   string   Código de erro do BofA.
+     *   $event['failureReason'] string   Descrição legível do motivo da falha.
      *   + demais campos padrão
      *
      * @param callable $handler  function(array $event): void
@@ -241,19 +245,19 @@ class BofACashProWebhookHandler
      * Dispara quando um ACH é devolvido pelo banco receptor.
      * Não se aplica a Zelle ou Wire (irreversíveis).
      *
-     * CÓDIGOS DE RETORNO ACH COMUNS (campo returnCode):
-     *   R01 → Saldo insuficiente
-     *   R02 → Conta encerrada
-     *   R03 → Conta inexistente
-     *   R04 → Número de conta inválido
-     *   R10 → Débito não autorizado pelo correntista
-     *   R20 → Conta não aceita débito ACH
+     * CAUSAS COMUNS:
+     *   R01 — Insufficient funds
+     *   R02 — Account closed
+     *   R03 — No account / unable to locate
+     *   R04 — Invalid account number
+     *   R07 — Authorization revoked
+     *   R10 — Customer advises not authorized
      *
      * ESTRUTURA DO $event:
-     *   $event['paymentId']    string   ID do ACH original devolvido.
-     *   $event['amount']       float    Valor devolvido.
-     *   $event['returnCode']   string   Código ACH de retorno (ex: 'R02').
-     *   $event['returnReason'] string   Descrição do código de retorno.
+     *   $event['paymentId']     string   ID do pagamento devolvido.
+     *   $event['returnCode']    string   Código de devolução ACH (ex: 'R01').
+     *   $event['returnReason']  string   Descrição legível do código.
+     *   $event['amount']        float    Valor devolvido.
      *   + demais campos padrão
      *
      * @param callable $handler  function(array $event): void
@@ -267,16 +271,12 @@ class BofACashProWebhookHandler
     /**
      * Registra handler para o evento BALANCE_BELOW_THRESHOLD.
      *
-     * Dispara quando o saldo da conta cai abaixo do limite
-     * configurado no painel do BofA CashPro.
-     *
-     * Use para acionar alertas operacionais e evitar falhas por
-     * saldo insuficiente em transferências futuras.
+     * Dispara quando o saldo disponível cai abaixo do limite configurado
+     * no BofA Developer Portal. Útil para alertas de liquidez.
      *
      * ESTRUTURA DO $event:
-     *   $event['currentBalance']   float   Saldo atual em USD.
-     *   $event['threshold']        float   Limite configurado que foi ultrapassado.
-     *   $event['currency']         string  'USD'
+     *   $event['currentBalance'] float    Saldo atual em USD.
+     *   $event['threshold']      float    Limite configurado que foi ultrapassado.
      *   + demais campos padrão
      *
      * @param callable $handler  function(array $event): void
@@ -288,10 +288,29 @@ class BofACashProWebhookHandler
     }
 
     /**
+     * Registra handler para o evento STATEMENT_AVAILABLE.
+     *
+     * Dispara mensalmente quando o extrato da conta está disponível.
+     *
+     * ESTRUTURA DO $event:
+     *   $event['statementId']   string   ID do extrato.
+     *   $event['statementDate'] string   Competência do extrato (YYYY-MM).
+     *   $event['downloadUrl']   string   URL autenticada para download (expira em 24h).
+     *   + demais campos padrão
+     *
+     * @param callable $handler  function(array $event): void
+     * @return static
+     */
+    public function onStatementAvailable(callable $handler): static
+    {
+        return $this->on(self::EVENT_STATEMENT_AVAILABLE, $handler);
+    }
+
+    /**
      * Registra um handler de fallback para eventos sem handler específico.
      *
-     * Útil para logging centralizado de todos os eventos recebidos,
-     * incluindo novos tipos de eventos que o BofA possa adicionar no futuro.
+     * Invocado quando o eventType recebido não tem handler registrado via on().
+     * Útil para logging de eventos inesperados ou novos tipos de evento do BofA.
      *
      * @param callable $handler  function(array $event): void
      * @return static
@@ -309,31 +328,28 @@ class BofACashProWebhookHandler
     /**
      * Ponto de entrada principal: processa um request HTTP do BofA.
      *
-     * Deve ser chamado no seu endpoint de webhook antes de qualquer
-     * lógica de negócio. Valida, parseia e despacha o evento.
+     * Deve ser chamado no endpoint de webhook antes de qualquer lógica de negócio.
+     * Valida, parseia e despacha o evento para o handler registrado.
      *
      * FLUXO INTERNO:
-     *   1. Valida método HTTP (deve ser POST)
-     *   2. Valida IP de origem (se validateIp = true)
-     *   3. Lê o body bruto (php://input)
-     *   4. Valida assinatura HMAC-SHA256 (se webhookSecret configurado)
-     *   5. Parseia e normaliza o payload JSON
-     *   6. Despacha para o handler registrado via on()
-     *   7. Retorna array com resultado do processamento
+     *   1. Valida IP de origem (se validateIp = true)
+     *   2. Lê o body bruto (php://input)
+     *   3. Valida assinatura HMAC-SHA256 (se webhookSecret configurado)
+     *   4. Parseia e normaliza o payload JSON
+     *   5. Despacha para o handler registrado via on()
+     *   6. Retorna array com resultado do processamento
      *
-     * RESPOSTA HTTP ESPERADA PELO BOFA:
-     *   O BofA espera HTTP 200 em até 10 segundos.
-     *   Se não receber, reenvia o evento (até 3 tentativas com backoff).
-     *   Use respondOk() logo após o handle() para responder rápido,
-     *   e processe em background se a lógica for demorada.
+     * PADRÃO RECOMENDADO:
+     *   $result = $handler->handle();
+     *   $handler->respondOk($result);
+     *   // Despache jobs assíncronos aqui, após responder ao BofA
      *
      * @param string|null $rawBody   Body bruto do request. null = lê de php://input.
      * @param array|null  $headers   Headers do request. null = lê de getallheaders().
      *
-     * @return array Resultado do processamento:
-     *               ['success' => bool, 'eventType' => string, 'eventId' => string, 'message' => string]
+     * @return array ['success' => bool, 'eventType' => string, 'eventId' => string, 'message' => string]
      *
-     * @throws GatewayException Se a assinatura for inválida (em produção).
+     * @throws GatewayException Se a assinatura for inválida.
      * @throws GatewayException Se o payload não for JSON válido.
      * @throws GatewayException Se o IP não estiver na whitelist (se validateIp = true).
      * @throws \Throwable       Qualquer exceção lançada pelo handler registrado.
@@ -353,6 +369,7 @@ class BofACashProWebhookHandler
         }
 
         // Validação de assinatura HMAC
+        // [CORREÇÃO CRÍTICA 3] Só pula validação se webhookSecret for null E strictSignature = false
         if ($this->webhookSecret !== null) {
             $signature = $headers['x-bofa-signature'] ?? '';
             $this->assertValidSignature($rawBody, $signature);
@@ -387,7 +404,7 @@ class BofACashProWebhookHandler
      * PADRÃO RECOMENDADO:
      *   $result = $handler->handle();
      *   $handler->respondOk($result);
-     *   // Aqui você pode despachar jobs para fila, por exemplo
+     *   // Aqui você pode despachar jobs para fila
      *
      * @param array $data Dados opcionais para incluir na resposta JSON.
      */
@@ -441,7 +458,7 @@ class BofACashProWebhookHandler
             ? substr($signature, 7)
             : $signature;
 
-        // Recalcula o hash esperado
+        // Recalcula o hash esperado sobre o body BRUTO (nunca sobre JSON re-serializado)
         $expectedHash = hash_hmac('sha256', $rawBody, $this->webhookSecret);
 
         // Comparação segura contra timing attacks
@@ -534,17 +551,17 @@ class BofACashProWebhookHandler
 
         // Base normalizada presente em todos os eventos
         $normalized = [
-            'eventId'   => $data['eventId'],
-            'eventType' => $data['eventType'],
-            'timestamp' => $data['timestamp']  ?? null,
-            'accountId' => $data['accountId']  ?? null,
-            'currency'  => $data['currency']   ?? 'USD',
-            'rawPayload'=> $data,
+            'eventId'    => $data['eventId'],
+            'eventType'  => $data['eventType'],
+            'timestamp'  => $data['timestamp']  ?? null,
+            'accountId'  => $data['accountId']  ?? null,
+            'currency'   => $data['currency']   ?? 'USD',
+            'rawPayload' => $data,
         ];
 
-        // Campos específicos por tipo de evento
         $eventType = $data['eventType'];
 
+        // Campos específicos por tipo de evento
         if (in_array($eventType, [
             self::EVENT_PAYMENT_RECEIVED,
             self::EVENT_PAYMENT_SENT,
@@ -561,23 +578,17 @@ class BofACashProWebhookHandler
                 'senderPhone'   => $data['senderPhone']   ?? null,
                 'senderName'    => $data['senderName']    ?? null,
                 'recipientName' => $data['recipientName'] ?? null,
-                // Específicos de PAYMENT_FAILED
                 'failureCode'   => $data['failureCode']   ?? null,
                 'failureReason' => $data['failureReason'] ?? null,
-                // Específicos de PAYMENT_RETURNED (ACH Return codes)
                 'returnCode'    => $data['returnCode']    ?? null,
                 'returnReason'  => $data['returnReason']  ?? null,
             ]);
-        }
-
-        if ($eventType === self::EVENT_BALANCE_BELOW_THRESHOLD) {
+        } elseif ($eventType === self::EVENT_BALANCE_BELOW_THRESHOLD) {
             $normalized = array_merge($normalized, [
                 'currentBalance' => (float) ($data['currentBalance'] ?? 0.0),
                 'threshold'      => (float) ($data['threshold']      ?? 0.0),
             ]);
-        }
-
-        if ($eventType === self::EVENT_STATEMENT_AVAILABLE) {
+        } elseif ($eventType === self::EVENT_STATEMENT_AVAILABLE) {
             $normalized = array_merge($normalized, [
                 'statementId'   => $data['statementId']   ?? null,
                 'statementDate' => $data['statementDate'] ?? null,
