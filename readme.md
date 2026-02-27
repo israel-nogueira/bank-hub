@@ -48,12 +48,16 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 | 🔵 **Stripe** | ✅ Pronto | Cartão de Crédito, Assinaturas, Payment Intents, Clientes, Refunds, Pre-auth/Capture | [📖 Docs](src/Gateways/Stripe/readme.md) |
 | 💙 **PayPal** | ✅ Pronto | Cartão de Crédito, Assinaturas, PayPal Checkout, Refunds, Pre-auth/Capture | [📖 Docs](src/Gateways/PayPal/readme.md) |
 | 🟢 **EtherGlobalAssets** | ✅ Pronto | PIX (apenas) | [📖 Docs](src/Gateways/EtherGlobalAssets/readme.md) |
+| 🏦 **Bank of America CashPro** | ✅ Pronto | Zelle (instantâneo, 24/7), ACH Same-Day, ACH Standard, Wire/Fedwire — roteamento automático por valor, webhooks Push Notification, agendamento ACH, cancelamento, saldo e extrato | [📖 Docs](src/Gateways/BofACashPro/readme.md) |
 
 > 🧪 **FakeBankGateway**: Gateway simulado completo que funciona **SEM internet, SEM API keys, SEM sandbox**. Use para desenvolver toda sua aplicação localmente e só conecte com APIs reais quando estiver pronto para produção!
-> 
+>
 > 📝 **Nota**: Gateways brasileiros (Asaas, Pagar.me, C6 Bank, MercadoPago, PagSeguro, EBANX) suportam PIX e Boleto. Gateways internacionais (Stripe, PayPal, Adyen) não suportam esses métodos nativos do Brasil.
-> 
+>
 > 🌎 **EBANX**: Gateway especializado em pagamentos internacionais para América Latina (7 países).
+>
+> 🏦 **Bank of America CashPro**: Gateway corporativo para operações bancárias nos EUA via Zelle, ACH e Wire. Ideal para fintechs que operam nos EUA e precisam receber e enviar dólares programaticamente. Requer conta BofA CashPro Online e licença Money Transmitter (FinCEN + estadual).
+
 
 **📢 Quer contribuir?** Implemente seu próprio gateway! [Veja como →](docs/creating-gateway.md)
 
