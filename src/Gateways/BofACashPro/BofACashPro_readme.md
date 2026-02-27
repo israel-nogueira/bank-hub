@@ -54,8 +54,8 @@ Qualquer transferência → transfer($request)
                     ↙       ↓        ↘
               Zelle       ACH        Wire
            ≤ $3.500    ≤ $50.000   > $50.000
-         Instantâneo    Same-day    Mesmo dia
-          Custo zero    ~$0,30       ~$25-35
+         Instantâneo   Same-day    Mesmo dia
+          Custo zero   ~$0,30      ~$25-35
 ```
 
 ### Por que três métodos?
