@@ -885,26 +885,41 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
         return (string) ($response['linkImagemBoleto'] ?? '');
     }
 
-    /**
-     * Solicita baixa (cancelamento) de um boleto registrado.
-     *
-     * Endpoint: POST /cobrancas/v2/boletos/{numero}/baixar
-     *
-     * ⚠ ATENÇÃO: a baixa é irreversível. Boleto já pago deve ser
-     * tratado direto com o gerente do Banco do Brasil.
-     *
-     * Retorna true quando codigoErroRegistro = 0 (sem erro).
-     */
-    public function cancelBoleto(string $transactionId): bool
-    {
-        $response = $this->request(
-            'POST',
-            self::PATH_BOLETO . "/boletos/{$transactionId}/baixar",
-            ['numeroConvenio' => $this->convenio],
-        );
+	/**
+	 * Solicita baixa (cancelamento) de um boleto registrado.
+	 *
+	 * Endpoint: POST /cobrancas/v2/boletos/{numero}/baixar
+	 *
+	 * ⚠ ATENÇÃO: a baixa é irreversível. Boleto já pago deve ser
+	 * tratado direto com o gerente do Banco do Brasil.
+	 *
+	 * Retorna PaymentResponse com success = true quando codigoErroRegistro = 0,
+	 * ou success = false com a mensagem de erro do BB em caso de falha.
+	 */
+	public function cancelBoleto(string $transactionId): PaymentResponse
+	{
+		$response = $this->request(
+			'POST',
+			self::PATH_BOLETO . "/boletos/{$transactionId}/baixar",
+			['numeroConvenio' => $this->convenio],
+		);
 
-        return ((int) ($response['codigoErroRegistro'] ?? 0)) === 0;
-    }
+		$success = ((int) ($response['codigoErroRegistro'] ?? 0)) === 0;
+		$message = $success
+			? 'Baixa solicitada com sucesso'
+			: (string) ($response['mensagem'] ?? 'Erro ao solicitar baixa do boleto');
+
+		return PaymentResponse::create(
+			success:         $success,
+			transactionId:   $transactionId,
+			status:          $success ? PaymentStatus::CANCELLED : PaymentStatus::FAILED,
+			amount:          0,
+			currency:        Currency::BRL,
+			message:         $message,
+			gatewayResponse: $response,
+			rawResponse:     $response,
+		);
+	}
 
     // ══════════════════════════════════════════════════════════
     //  TRANSFERÊNCIAS — PIX / TED
@@ -1138,27 +1153,43 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
      *
      * @return array<int, array<string, mixed>> Lista de lançamentos do período.
      */
-    public function getStatement(DateTime $from, DateTime $to): array
-    {
-        // FIX #8 — Passa agência e conta para suportar multi-conta
-        $query = [
-            'dataInicioSaldo' => $from->format('d.m.Y'),
-            'dataFimSaldo'    => $to->format('d.m.Y'),
-        ];
-        if ($this->agencia !== '') {
-            $query['agencia'] = $this->agencia;
-        }
-        if ($this->conta !== '') {
-            $query['contaCorrente'] = $this->conta;
-        }
+	public function getStatement(
+			DateTime $from,
+			DateTime $to,
+			int      $page    = 1,
+			int      $perPage = 50,
+		): array {
+			// page 1 → indice 0, page 2 → indice 50, etc.
+			$indice = ($page - 1) * $perPage;
 
-        $response = $this->request('GET', self::PATH_CONTA . '/extrato/saldo-dia', [], $query);
+			$query = [
+				'dataInicioSaldo' => $from->format('d.m.Y'),
+				'dataFimSaldo'    => $to->format('d.m.Y'),
+				'indice'          => $indice,
+				'quantidade'      => $perPage,
+			];
 
-        /** @var array<int, array<string, mixed>> $lancamentos */
-        $lancamentos = $response['lancamentos'] ?? $response['listaLancamentos'] ?? [];
+			if ($this->agencia !== '') {
+				$query['agencia'] = $this->agencia;
+			}
+			if ($this->conta !== '') {
+				$query['contaCorrente'] = $this->conta;
+			}
 
-        return $lancamentos;
-    }
+			$response = $this->request('GET', self::PATH_CONTA . '/extrato/saldo-dia', [], $query);
+
+			/** @var array<int, array<string, mixed>> $lancamentos */
+			$lancamentos = $response['lancamentos'] ?? $response['listaLancamentos'] ?? [];
+			$total       = (int) ($response['quantidadeRegistros'] ?? count($lancamentos));
+
+			return [
+				'lancamentos'         => $lancamentos,
+				'quantidadeRegistros' => $total,
+				'indicePrimeiro'      => $indice,
+				'pagina'              => $page,
+				'totalPaginas'        => $perPage > 0 ? (int) ceil($total / $perPage) : null,
+			];
+		}
 
     // ══════════════════════════════════════════════════════════
     //  CONSULTAS
