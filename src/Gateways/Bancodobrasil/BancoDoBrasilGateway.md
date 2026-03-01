@@ -45,6 +45,7 @@ Gateway de integração com as APIs do **Banco do Brasil** para o PaymentHub.
 | Consulta de Saldo | ✅ | API Conta Corrente v1 |
 | Consulta de Extrato | ✅ | API Conta Corrente v1 |
 | Webhooks (PIX + Boleto) | ✅ | APIs PIX e Cobrança |
+| Webhook Handler (BancoDoBrasilWebhookHandler) | ✅ | — |
 | Cartão de Crédito/Débito | ❌ | Não disponível via API BB |
 | Assinaturas | ❌ | Use Asaas ou PagarMe |
 | Split de Pagamento | ❌ | Não disponível via API BB |
@@ -87,37 +88,33 @@ variacaoCarteira     → Variação da carteira (ex: 35)
 
 ### 5. Certificado Digital (apenas Produção)
 
-> Em produção (desde junho/2024), o BB exige um certificado digital registrado no portal. Cadastre seu certificado `.pfx` no menu de credenciais do portal antes de subir para produção.
+> Em produção (desde junho/2024), o BB exige um certificado digital registrado no portal. Sem ele a API retorna HTTP 503 `bad_certificate`.
 
 ---
 
 ## ⚙️ Configuração
 
 ```php
-use IsraelNogueira\PaymentHub\PaymentHub;
 use IsraelNogueira\PaymentHub\Gateways\BancoDoBrasil\BancoDoBrasilGateway;
 
 $gateway = new BancoDoBrasilGateway(
     clientId:         'seu-client-id',
     clientSecret:     'seu-client-secret',
-    developerAppKey:  'sua-developer-app-key',
-    pixKey:           'sua-chave-pix@empresa.com',  // e-mail, CPF, CNPJ, telefone ou aleatória
-    convenio:         1234567,                       // Para boletos
+    developerAppKey:  'gw-dev-app-key',      // sandbox
+    pixKey:           'sua-chave@pix.com',
+    convenio:         3128557,
     carteira:         17,
     variacaoCarteira: 35,
     agencia:          '0001',
     conta:            '123456',
-    sandbox:          true,   // false em produção
+    sandbox:          true,
+    // certPath:      '/etc/ssl/bb/cert.pem', // obrigatório em produção
 );
-
-$hub = new PaymentHub($gateway);
 ```
 
 ---
 
-## 💰 PIX
-
-### Criar Cobrança
+## 💠 PIX
 
 ```php
 use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
@@ -127,41 +124,15 @@ $request = PixPaymentRequest::create(
     description:      'Pedido #1234',
     customerName:     'Maria Silva',
     customerDocument: '123.456.789-00',
-    metadata: [
-        'expiresIn' => 3600, // segundos (padrão: 86400 = 24h)
-    ],
+    customerEmail:    'maria@email.com',
+    metadata: ['expiresIn' => 3600],
 );
 
 $pix = $hub->createPixPayment($request);
 
-echo $pix->transactionId;              // txid único
-echo $pix->metadata['pixCopiaECola']; // código para copiar e colar
-echo $pix->metadata['qrCode'];         // imagem do QR Code
-echo $pix->metadata['location'];       // URL do location PIX
-```
-
-### Obter QR Code e Copia & Cola
-
-```php
-$qrCode    = $hub->getPixQrCode($pix->transactionId);
-$copyPaste = $hub->getPixCopyPaste($pix->transactionId);
-```
-
-### Consultar Status
-
-```php
-$status = $hub->getTransactionStatus($pix->transactionId);
-// status: PENDING | APPROVED | CANCELLED
-```
-
-### Listar Cobranças
-
-```php
-$cobranças = $gateway->listTransactions([
-    'inicio' => (new DateTime('-7 days'))->format(DateTime::RFC3339),
-    'fim'    => (new DateTime())->format(DateTime::RFC3339),
-    'status' => 'ATIVA', // ATIVA | CONCLUIDA | REMOVIDA_PELO_USUARIO_RECEBEDOR
-]);
+echo $pix->transactionId;               // txid
+echo $pix->metadata['pixCopiaECola'];   // string para colar no app bancário
+echo $pix->metadata['location'];        // URL do QR Code dinâmico
 ```
 
 ---
@@ -178,14 +149,13 @@ $request = BoletoPaymentRequest::create(
     customerDocument: '987.654.321-00',
     dueDate:          date('Y-m-d', strtotime('+5 days')),
     metadata: [
+        'nossoNumero'  => '0000000001',  // sequencial único — obrigatório em produção
         'address'      => 'Rua das Flores, 123',
         'neighborhood' => 'Centro',
         'city'         => 'São Paulo',
-        'cityCode'     => 3550308,  // Código IBGE da cidade
+        'cityCode'     => 3550308,
         'state'        => 'SP',
         'zipCode'      => '01310-100',
-        'fine'         => 2.0,      // 2% ao mês (juros mora)
-        'discount'     => 10.00,    // R$ 10,00 de desconto até o vencimento
     ],
 );
 
@@ -193,20 +163,18 @@ $boleto = $hub->createBoleto($request);
 
 echo $boleto->boletoId;       // Número do título
 echo $boleto->linhaDigitavel; // Linha digitável
-echo $boleto->barCode;        // Código de barras
 echo $boleto->boletoUrl;      // URL para impressão
 
-// Cancelar boleto
-$gateway->cancelBoleto($boleto->boletoId);
+// Cancelar boleto — retorna PaymentResponse
+$cancelado = $gateway->cancelBoleto($boleto->boletoId);
+echo $cancelado->success ? 'Baixado' : $cancelado->message;
 ```
 
-> **⚠️ Atenção com a baixa:** A baixa (cancelamento) é irreversível. Se o boleto já foi pago, entre em contato com o gerente para resolver.
+> **⚠️ Atenção com a baixa:** A baixa é irreversível. Boleto já pago deve ser tratado diretamente com o gerente BB.
 
 ---
 
 ## 🔀 Boleto Híbrido (Boleto + PIX)
-
-O **Boleto Híbrido** é um título que permite pagamento tanto via **código de barras** quanto via **QR Code PIX** — tudo no mesmo documento.
 
 ```php
 $request = BoletoPaymentRequest::create(
@@ -215,16 +183,13 @@ $request = BoletoPaymentRequest::create(
     // ... demais campos obrigatórios ...
     metadata: [
         // ... endereço ...
-        'hibrido' => true, // ← ativa o Boleto + PIX
+        'hibrido' => true, // ← ativa o Boleto + PIX no mesmo título
     ],
 );
 
 $boleto = $hub->createBoleto($request);
 
-// Dados do Boleto
 echo $boleto->linhaDigitavel;
-
-// Dados do PIX embutido
 echo $boleto->metadata['pixCopiaECola'];
 echo $boleto->metadata['qrCodePix'];
 ```
@@ -246,7 +211,7 @@ $request = new TransferRequest(
     beneficiaryDocument: '111.222.333-44',
     description:         'Pagamento de fornecedor',
     metadata: [
-        'pixKey' => 'carlos@email.com', // CPF, CNPJ, e-mail, telefone ou chave aleatória
+        'pixKey' => 'carlos@email.com',
     ],
 );
 
@@ -261,11 +226,11 @@ $request = new TransferRequest(
     beneficiaryName:     'Empresa XYZ Ltda',
     beneficiaryDocument: '12.345.678/0001-99',
     description:         'Pagamento NF 001234',
-    bankCode:            '237',  // Bradesco
+    bankCode:            '237',
     agency:              '1234',
     account:             '56789',
     accountDigit:        '0',
-    accountType:         'checking', // ou 'savings' para poupança
+    accountType:         'checking',
 );
 
 $transfer = $gateway->transfer($request);
@@ -274,10 +239,7 @@ $transfer = $gateway->transfer($request);
 ### Agendamento e Cancelamento
 
 ```php
-// Agendar
 $agendado = $gateway->scheduleTransfer($request, '2025-03-31');
-
-// Cancelar o agendamento
 $gateway->cancelScheduledTransfer($agendado->transferId);
 ```
 
@@ -289,20 +251,39 @@ $gateway->cancelScheduledTransfer($agendado->transferId);
 // Saldo atual da conta
 $saldo = $hub->getBalance();
 
-echo $saldo->availableBalance; // Saldo disponível
-echo $saldo->totalBalance;     // Saldo total (incluindo bloqueios)
-echo $saldo->metadata['bloqueado_judicial'];       // Valor bloqueado judicialmente
-echo $saldo->metadata['bloqueado_administrativo']; // Valor bloqueado administrativamente
+echo $saldo->availableBalance;                          // Saldo disponível
+echo $saldo->totalBalance;                              // Saldo total (incluindo bloqueios)
+echo $saldo->metadata['bloqueado_judicial'];            // Valor bloqueado judicialmente
+echo $saldo->metadata['bloqueado_administrativo'];      // Valor bloqueado administrativamente
 
-// Extrato de um período
-$lancamentos = $gateway->getStatement(
+// Extrato — página 1, 50 registros (padrão)
+$extrato = $gateway->getStatement(
     new DateTime('-30 days'),
-    new DateTime()
+    new DateTime(),
 );
 
-foreach ($lancamentos as $l) {
-    echo "[{$l['data']}] R$ {$l['valor']} — {$l['descricao']}\n";
+// O retorno é um array estruturado:
+// $extrato['lancamentos']         → array de lançamentos
+// $extrato['quantidadeRegistros'] → total de registros no período
+// $extrato['pagina']              → página atual
+// $extrato['totalPaginas']        → total de páginas
+// $extrato['indicePrimeiro']      → offset usado na chamada à API
+
+foreach ($extrato['lancamentos'] as $l) {
+    $sinal = ($l['creditoDebito'] ?? '') === 'C' ? '+' : '-';
+    echo "[{$l['data']}] {$sinal} R$ {$l['valor']} — {$l['descricao']}\n";
 }
+
+// Paginação explícita
+$pagina2 = $gateway->getStatement(
+    new DateTime('-30 days'),
+    new DateTime(),
+    page:    2,
+    perPage: 25,
+);
+echo "Página 2: " . count($pagina2['lancamentos']) . " registros\n";
+echo "Total:    " . $pagina2['quantidadeRegistros'] . " lançamentos\n";
+echo "Páginas:  " . $pagina2['totalPaginas'] . "\n";
 ```
 
 ---
@@ -325,7 +306,28 @@ $webhooks = $gateway->listWebhooks();
 $gateway->deleteWebhook($webhook->webhookId);
 ```
 
-### Exemplo de payload recebido — PIX pago
+### Processando com BancoDoBrasilWebhookHandler
+
+```php
+use IsraelNogueira\PaymentHub\Gateways\BancoDoBrasil\BancoDoBrasilWebhookHandler;
+
+$handler = new BancoDoBrasilWebhookHandler(
+    webhookToken: 'seu-token-secreto',
+);
+
+$handler->onPixRecebido(function (array $pix) {
+    // $pix['txid'], $pix['valor'], $pix['pagador'], etc.
+    // confirmar pedido no sistema
+});
+
+$handler->onBoletoLiquidado(function (array $boleto) {
+    // $boleto['nossoNumero'], $boleto['valor'], etc.
+});
+
+$handler->handle(); // valida token, processa payload, responde 200
+```
+
+### Exemplo de payload — PIX pago
 
 ```json
 {
@@ -341,19 +343,6 @@ $gateway->deleteWebhook($webhook->webhookId);
 }
 ```
 
-### Processando o webhook
-
-```php
-// No seu endpoint (ex: /webhooks/bb)
-$payload = json_decode(file_get_contents('php://input'), true);
-
-foreach ($payload['pix'] ?? [] as $pix) {
-    $txid  = $pix['txid'];
-    $valor = $pix['valor'];
-    // ... confirmar pedido no seu sistema
-}
-```
-
 ---
 
 ## ↩️ Estorno PIX
@@ -362,7 +351,7 @@ foreach ($payload['pix'] ?? [] as $pix) {
 use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
 
 $request = new RefundRequest(
-    transactionId: 'E00038166202501141052152649956', // E2EId da transação original
+    transactionId: 'E00038166202501141052152649956',
     amount:        50.00,
     reason:        'Produto devolvido',
     metadata: [
@@ -379,10 +368,11 @@ echo $estorno->status; // EM_PROCESSAMENTO | DEVOLVIDO
 ## 📁 Estrutura de Arquivos
 
 ```
-src/Gateways/BancoDoBrasil/
-├── BancoDoBrasilGateway.php    ← Implementação principal
-├── bb-examples.php             ← Exemplos práticos de uso
-└── readme.md                   ← Esta documentação
+src/Gateways/Bancodobrasil/
+├── BancoDoBrasilGateway.php          ← Implementação principal
+├── BancoDoBrasilWebhookHandler.php   ← Handler de webhooks PIX e Boleto
+├── bb-examples.php                   ← Exemplos práticos de uso
+└── BancoDoBrasilGateway.md           ← Esta documentação
 ```
 
 ---
@@ -398,16 +388,16 @@ src/Gateways/BancoDoBrasil/
 | `getPixCopyPaste()` | Código PIX Copia e Cola |
 | `createBoleto()` | Registro de boleto (simples ou híbrido) |
 | `getBoletoUrl()` | URL do boleto para impressão |
-| `cancelBoleto()` | Baixa (cancelamento) do boleto |
+| `cancelBoleto()` | Baixa (cancelamento) — retorna `PaymentResponse` |
 | `refund()` | Estorno/devolução de PIX |
 | `transfer()` | Transferência automática (PIX ou TED) |
 | `scheduleTransfer()` | Agendamento de transferência |
 | `cancelScheduledTransfer()` | Cancelamento de agendamento |
 | `getBalance()` | Saldo da conta corrente |
-| `getStatement()` | Extrato da conta corrente |
+| `getStatement()` | Extrato paginado da conta corrente |
 | `getTransactionStatus()` | Status de cobrança PIX ou boleto |
 | `listTransactions()` | Lista de cobranças PIX |
-| `registerWebhook()` | Registrar notificação |
+| `registerWebhook()` | Registrar URL de notificação |
 | `listWebhooks()` | Listar webhooks |
 | `deleteWebhook()` | Remover webhook |
 
@@ -437,7 +427,6 @@ try {
     echo "Erro: "    . $e->getMessage() . "\n";
     echo "HTTP: "    . $e->getCode() . "\n";
 
-    // Contexto detalhado da resposta do BB
     $ctx = $e->getContext();
     echo "Resposta: " . json_encode($ctx['response'] ?? []) . "\n";
 }
@@ -462,9 +451,9 @@ try {
 | Sandbox | `https://api.sandbox.bb.com.br` | `https://oauth.sandbox.bb.com.br` |
 | Produção | `https://api.bb.com.br` | `https://oauth.bb.com.br` |
 
-### Header de autenticação
+### Header da App Key
 
-| Ambiente | Header da App Key |
+| Ambiente | Header |
 |---|---|
 | Sandbox | `gw-dev-app-key` |
 | Produção | `gw-app-key` |

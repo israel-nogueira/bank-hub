@@ -19,6 +19,7 @@ use IsraelNogueira\PaymentHub\PaymentHub;
 use IsraelNogueira\PaymentHub\Gateways\BancoDoBrasil\BancoDoBrasilGateway;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\BoletoPaymentRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\TransferRequest;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 
@@ -66,22 +67,15 @@ try {
     echo "   Status:         " . $pix->status->value . "\n";
     echo "   Valor:          R$ " . number_format($pix->amount, 2, ',', '.') . "\n";
     echo "   PIX Copia&Cola: " . ($pix->metadata['pixCopiaECola'] ?? 'N/A') . "\n";
-    echo "   Location:       " . ($pix->metadata['location'] ?? 'N/A') . "\n\n";
-
-    // Consultar QR Code
-    $qrCode = $hub->getPixQrCode($pix->transactionId);
-    echo "   QR Code: " . substr($qrCode, 0, 50) . "...\n\n";
-
-    // Consultar status
-    $status = $hub->getTransactionStatus($pix->transactionId);
-    echo "   Status atual: " . $status->status->value . "\n\n";
+    echo "   Location:       " . ($pix->metadata['location'] ?? 'N/A') . "\n";
+    echo "   Mensagem:       " . $pix->message . "\n\n";
 
 } catch (GatewayException $e) {
     echo "❌ Erro PIX: " . $e->getMessage() . " (HTTP " . $e->getCode() . ")\n\n";
 }
 
 // ─────────────────────────────────────────────────────────────
-//  2. BOLETO — Registro de Boleto Bancário
+//  2. BOLETO BANCÁRIO
 // ─────────────────────────────────────────────────────────────
 
 echo "=== 2. BOLETO BANCÁRIO ===\n\n";
@@ -89,33 +83,32 @@ echo "=== 2. BOLETO BANCÁRIO ===\n\n";
 try {
     $boletoRequest = BoletoPaymentRequest::create(
         amount:           299.90,
-        description:      'Mensalidade Janeiro/2025',
+        description:      'Fatura #456 — Mensalidade',
         customerName:     'João Pereira',
         customerDocument: '987.654.321-00',
-        customerEmail:    'joao@email.com',
-        customerPhone:    '11987654321',
         dueDate:          date('Y-m-d', strtotime('+5 days')),
         metadata: [
+            'nossoNumero'  => '0000000001',   // Sequencial único — obrigatório em produção
             'address'      => 'Rua das Flores, 123',
             'neighborhood' => 'Centro',
             'city'         => 'São Paulo',
             'cityCode'     => 3550308,
             'state'        => 'SP',
             'zipCode'      => '01310-100',
-            'fine'         => 2.0,      // 2% ao mês de juros mora
-            'discount'     => 10.00,    // R$ 10,00 de desconto até o vencimento
         ],
     );
 
     $boleto = $hub->createBoleto($boletoRequest);
 
     echo "✅ Boleto registrado!\n";
-    echo "   Número:          " . $boleto->boletoId . "\n";
-    echo "   Linha Digitável: " . $boleto->linhaDigitavel . "\n";
-    echo "   Código de Barras:" . $boleto->barCode . "\n";
-    echo "   URL do Boleto:   " . $boleto->boletoUrl . "\n";
-    echo "   Vencimento:      " . $boleto->dueDate . "\n";
-    echo "   Valor:           R$ " . number_format($boleto->amount, 2, ',', '.') . "\n\n";
+    echo "   Número:        " . $boleto->boletoId . "\n";
+    echo "   URL do Boleto: " . $boleto->boletoUrl . "\n";
+    echo "   Linha Digit.:  " . ($boleto->linhaDigitavel ?? 'N/A') . "\n";
+    echo "   Mensagem:      " . $boleto->message . "\n\n";
+
+    // Cancelar boleto
+    $cancelado = $gateway->cancelBoleto($boleto->boletoId);
+    echo "   Cancelamento: " . ($cancelado->success ? '✅ OK' : '❌ Falhou — ' . $cancelado->message) . "\n\n";
 
 } catch (GatewayException $e) {
     echo "❌ Erro Boleto: " . $e->getMessage() . " (HTTP " . $e->getCode() . ")\n\n";
@@ -268,20 +261,35 @@ try {
     echo "   Bloqueado Judicial:       R$ " . number_format($saldo->metadata['bloqueado_judicial'] ?? 0, 2, ',', '.') . "\n";
     echo "   Bloqueado Administrativo: R$ " . number_format($saldo->metadata['bloqueado_administrativo'] ?? 0, 2, ',', '.') . "\n\n";
 
-    // Extrato do último mês
-	$extrato = $gateway->getStatement(new DateTime('-30 days'), new DateTime());
-	
-    echo "✅ Extrato dos últimos 30 dias (" . count($extrato) . " lançamentos):\n";
+    // Extrato do último mês — página 1, 50 registros
+    $extrato = $gateway->getStatement(new DateTime('-30 days'), new DateTime());
 
-	foreach (array_slice($extrato['lancamentos'], 0, 5) as $lancamento) { 
-        $valor = isset($lancamento['creditoDebito'])
+    echo "✅ Extrato dos últimos 30 dias (" . $extrato['quantidadeRegistros'] . " lançamentos";
+    if ($extrato['totalPaginas'] !== null && $extrato['totalPaginas'] > 1) {
+        echo ", " . $extrato['totalPaginas'] . " páginas";
+    }
+    echo "):\n";
+
+    foreach (array_slice($extrato['lancamentos'], 0, 5) as $lancamento) {
+        $sinal = isset($lancamento['creditoDebito'])
             ? ($lancamento['creditoDebito'] === 'C' ? '+ ' : '- ')
             : '';
-        echo "   [{$lancamento['data']}] {$valor}R$ " .
+        echo "   [{$lancamento['data']}] {$sinal}R$ " .
              number_format($lancamento['valor'] ?? 0, 2, ',', '.') .
              " — " . ($lancamento['descricao'] ?? 'Sem descrição') . "\n";
     }
     echo "\n";
+
+    // Exemplo com paginação explícita
+    if (($extrato['totalPaginas'] ?? 1) > 1) {
+        $pagina2 = $gateway->getStatement(
+            new DateTime('-30 days'),
+            new DateTime(),
+            page:    2,
+            perPage: 50,
+        );
+        echo "   Página 2: " . count($pagina2['lancamentos']) . " registros\n\n";
+    }
 
 } catch (GatewayException $e) {
     echo "❌ Erro Saldo/Extrato: " . $e->getMessage() . "\n\n";
@@ -319,8 +327,6 @@ try {
 echo "=== 9. ESTORNO PIX ===\n\n";
 
 try {
-    use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
-
     $estornoRequest = new RefundRequest(
         transactionId: 'E00038166202501141052152649956', // E2EId da transação original
         amount:        50.00,
