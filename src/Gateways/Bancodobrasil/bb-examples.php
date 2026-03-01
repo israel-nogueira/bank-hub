@@ -269,13 +269,11 @@ try {
     echo "   Bloqueado Administrativo: R$ " . number_format($saldo->metadata['bloqueado_administrativo'] ?? 0, 2, ',', '.') . "\n\n";
 
     // Extrato do último mês
-    $extrato = $gateway->getStatement(
-        new DateTime('-30 days'),
-        new DateTime()
-    );
-
+	$extrato = $gateway->getStatement(new DateTime('-30 days'), new DateTime());
+	
     echo "✅ Extrato dos últimos 30 dias (" . count($extrato) . " lançamentos):\n";
-    foreach (array_slice($extrato, 0, 5) as $lancamento) {
+
+	foreach (array_slice($extrato['lancamentos'], 0, 5) as $lancamento) { 
         $valor = isset($lancamento['creditoDebito'])
             ? ($lancamento['creditoDebito'] === 'C' ? '+ ' : '- ')
             : '';
