@@ -51,6 +51,7 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 | 🏦 **Banco do Brasil** | ✅ Pronto | PIX (QR Code Dinâmico v2), Boleto Bancário, Boleto Híbrido (Boleto + PIX), Estorno PIX, Transferências PIX/TED, Agendamento, Saldo, Extrato, Webhooks — mTLS obrigatório em produção | [📖 Docs](src/Gateways/Bancodobrasil/BancoDoBrasilGateway.md) |
 | 🏦 **Bank of America CashPro** | ✅ Pronto | Zelle (instantâneo, 24/7), ACH Same-Day, ACH Standard, Wire/Fedwire — roteamento automático por valor, webhooks Push Notification, agendamento ACH, cancelamento, saldo e extrato | [📖 Docs](src/Gateways/BofACashPro/readme.md) |
 | 🟣 **NuBank (NuPay)** | ✅ Pronto | Pagamento via app Nubank (redirecionamento), Estorno total/parcial, Consulta de status — método exclusivo para clientes Nubank | [📖 Docs](src/Gateways/NuBank/readme.md) |
+| 🏦 **Itaú Unibanco** | ✅ Pronto | PIX (QR Code Dinâmico v2), Boleto Bancário, Estorno PIX, Transferências PIX/TED, Agendamento, Saldo, Extrato, Webhooks PIX, Gestão de Clientes — mTLS obrigatório em produção | [📖 Docs](src/Gateways/Itau/ItauGateway.md) |
 
 > 🧪 **FakeBankGateway**: Gateway simulado completo que funciona **SEM internet, SEM API keys, SEM sandbox**. Use para desenvolver toda sua aplicação localmente e só conecte com APIs reais quando estiver pronto para produção!
 >
@@ -63,7 +64,8 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 > 🏦 **Bank of America CashPro**: Gateway corporativo para operações bancárias nos EUA via Zelle, ACH e Wire. Ideal para fintechs que operam nos EUA e precisam receber e enviar dólares programaticamente. Requer conta BofA CashPro Online e licença Money Transmitter (FinCEN + estadual).
 >
 > 🟣 **NuBank (NuPay)**: Método de pagamento exclusivo para clientes Nubank via redirecionamento para o app. Não é PIX nem cartão — o cliente confirma com a senha de 4 dígitos diretamente no app Nubank. Requer cadastro no [NuPay for Business](https://nupaybusiness.com.br). Use `createPayment()` em vez de `createPixPayment()`.
-
+>
+> 🏦 **Itaú Unibanco**: Gateway bancário oficial do Itaú. Ideal para empresas que já possuem conta Itaú e precisam integrar PIX, boleto e transferências diretamente com o banco, sem intermediários. Autenticação via OAuth 2.0 com renovação automática de token; certificado digital mTLS (ICP-Brasil) obrigatório em produção. Convênio necessário para emitir boletos — obtenha com seu gerente Itaú.
 
 **📢 Quer contribuir?** Implemente seu próprio gateway! [Veja como →](docs/creating-gateway.md)
 
