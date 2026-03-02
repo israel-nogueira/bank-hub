@@ -50,6 +50,7 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 | 🟢 **EtherGlobalAssets** | ✅ Pronto | PIX (apenas) | [📖 Docs](src/Gateways/EtherGlobalAssets/readme.md) |
 | 🏦 **Banco do Brasil** | ✅ Pronto | PIX (QR Code Dinâmico v2), Boleto Bancário, Boleto Híbrido (Boleto + PIX), Estorno PIX, Transferências PIX/TED, Agendamento, Saldo, Extrato, Webhooks — mTLS obrigatório em produção | [📖 Docs](src/Gateways/Bancodobrasil/BancoDoBrasilGateway.md) |
 | 🏦 **Bank of America CashPro** | ✅ Pronto | Zelle (instantâneo, 24/7), ACH Same-Day, ACH Standard, Wire/Fedwire — roteamento automático por valor, webhooks Push Notification, agendamento ACH, cancelamento, saldo e extrato | [📖 Docs](src/Gateways/BofACashPro/readme.md) |
+| 🟣 **NuBank (NuPay)** | ✅ Pronto | Pagamento via app Nubank (redirecionamento), Estorno total/parcial, Consulta de status — método exclusivo para clientes Nubank | [📖 Docs](src/Gateways/NuBank/readme.md) |
 
 > 🧪 **FakeBankGateway**: Gateway simulado completo que funciona **SEM internet, SEM API keys, SEM sandbox**. Use para desenvolver toda sua aplicação localmente e só conecte com APIs reais quando estiver pronto para produção!
 >
@@ -60,6 +61,8 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 > 🏦 **Banco do Brasil**: Gateway bancário oficial do BB. Ideal para empresas que já possuem conta BB e precisam integrar PIX, boleto e transferências diretamente com o banco, sem intermediários. Exige certificado digital (mTLS) em produção e convênio para boletos — obtenha com seu gerente de relacionamento BB.
 >
 > 🏦 **Bank of America CashPro**: Gateway corporativo para operações bancárias nos EUA via Zelle, ACH e Wire. Ideal para fintechs que operam nos EUA e precisam receber e enviar dólares programaticamente. Requer conta BofA CashPro Online e licença Money Transmitter (FinCEN + estadual).
+>
+> 🟣 **NuBank (NuPay)**: Método de pagamento exclusivo para clientes Nubank via redirecionamento para o app. Não é PIX nem cartão — o cliente confirma com a senha de 4 dígitos diretamente no app Nubank. Requer cadastro no [NuPay for Business](https://nupaybusiness.com.br). Use `createPayment()` em vez de `createPixPayment()`.
 
 
 **📢 Quer contribuir?** Implemente seu próprio gateway! [Veja como →](docs/creating-gateway.md)
@@ -534,6 +537,17 @@ $hub = new PaymentHub(new BancoDoBrasilGateway(
     sandbox:         false,
     certPath:        '/etc/ssl/bb/cert.pem', // obrigatório em produção
 ));
+
+// Ou com NuPay (botão "Pagar com Nubank"):
+$hub = new PaymentHub(new NuBankGateway(
+    merchantKey:   $_ENV['NUPAY_MERCHANT_KEY'],
+    merchantToken: $_ENV['NUPAY_MERCHANT_TOKEN'],
+    sandbox:       true,
+    merchantName:  'Minha Loja',
+    callbackUrl:   'https://minha-loja.com/nupay/notify',
+));
+// ⚠️ NuPay usa createPayment() — não createPixPayment()
+// A resposta contém rawResponse['_paymentUrl'] → redirecione o cliente para lá
 
 // Todo o resto do código continua igual! 🎉
 ```
