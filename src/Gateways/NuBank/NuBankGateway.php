@@ -32,170 +32,106 @@ use IsraelNogueira\PaymentHub\Enums\Currency;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 
 /**
- * NuBank Gateway - Open Finance / BaaS
+ * NuBank Gateway — NuPay for Business
  *
- * Integração com a API NuBank via Open Finance / NuBaaS.
+ * ⚠️  O NuPay NÃO é um gateway de pagamentos tradicional.
+ *     É um método de pagamento exclusivo para clientes Nubank,
+ *     que funciona via REDIRECIONAMENTO para o app do Nubank.
+ *     O cliente autoriza com a senha de 4 dígitos dentro do app.
+ *     Sua loja nunca toca em dados de cartão ou conta bancária.
  *
- * PRÉ-REQUISITOS
- * --------------
- * - Conta NuBaaS ou parceria via Open Finance aprovada
- * - Client ID e Client Secret obtidos via developers.nubank.com.br
- * - Certificate (.p12 ou .pem) para autenticação mTLS em produção
+ * ✅  O QUE ESTA API REALMENTE FAZ:
+ *     - Criar pedido de pagamento NuPay → retorna paymentUrl
+ *     - Consultar status do pagamento
+ *     - Cancelar pagamento ainda não pago (WAITING_PAYMENT_METHOD)
+ *     - Estornar pagamento total ou parcialmente
+ *     - Consultar status de um estorno
  *
- * ONBOARDING
- * ----------
- * 1. Acesse: https://developers.nubank.com.br
- * 2. Cadastre sua empresa e aguarde aprovação
- * 3. Receba as credenciais OAuth2 e o certificado mTLS
+ * ❌  O QUE NÃO EXISTE NESTA API (lança GatewayException):
+ *     - PIX (use C6Bank, Asaas, PagarMe, Banco do Brasil)
+ *     - Cartão de crédito/débito direto
+ *     - Boleto
+ *     - Assinaturas/recorrência
+ *     - Transferências, Wallets, Escrow, Split, Sub-contas
+ *     - Saldo, Conciliação (existe API separada de conciliação)
  *
- * REFERÊNCIAS
- * -----------
- * @see https://developers.nubank.com.br
+ * AUTENTICAÇÃO — dois headers fixos, sem OAuth2, sem Bearer token:
+ *     X-Merchant-Key:   {sua API Key}
+ *     X-Merchant-Token: {seu API Token}
+ *     Obtidos no Painel do Lojista → seção Credenciais.
  *
+ * ENDPOINTS REAIS (documentação oficial NuPay for Business):
+ *     Sandbox:   https://sandbox-api.spinpay.com.br
+ *     Produção:  https://api.spinpay.com.br
+ *
+ * @see https://docs.nupaybusiness.com.br/checkout/docs/openapi/index.html
  * @author  PaymentHub
  * @version 1.0.0
  */
 class NuBankGateway implements PaymentGatewayInterface
 {
-    // ----------------------------------------------------------
-    //  URLs base por ambiente
-    // ----------------------------------------------------------
-
-    /** URL de produção NuBaaS / Open Finance */
-    private const PRODUCTION_URL = 'https://api.nubank.com.br';
-
-    /** URL de sandbox para testes (ambiente de homologação NuBank) */
-    private const SANDBOX_URL = 'https://sandbox.nubank.com.br';
-
-    /** Endpoint OAuth2 — produção */
-    private const OAUTH_URL = 'https://api.nubank.com.br/oauth/token';
-
-    /** Endpoint OAuth2 — sandbox */
-    private const OAUTH_SANDBOX_URL = 'https://sandbox.nubank.com.br/oauth/token';
-
-    // ----------------------------------------------------------
-    //  Estado interno
-    // ----------------------------------------------------------
+    // URLs reais — confirmadas na documentação NuPay for Business
+    private const PRODUCTION_URL = 'https://api.spinpay.com.br';
+    private const SANDBOX_URL    = 'https://sandbox-api.spinpay.com.br';
 
     private string $baseUrl;
-    private string $oauthUrl;
-    private ?string $accessToken = null;
-    private ?int $tokenExpiry = null;
 
     public function __construct(
-        private readonly string $clientId,
-        private readonly string $clientSecret,
-        private readonly bool   $sandbox = false,
-        /** Caminho para o certificado mTLS (.pem), obrigatório em produção */
-        private readonly ?string $certPath = null,
-        private readonly ?string $certPassword = null,
+        /** API Key — Painel do Lojista NuPay → seção Credenciais */
+        private readonly string  $merchantKey,
+        /** API Token — Painel do Lojista NuPay → seção Credenciais */
+        private readonly string  $merchantToken,
+        private readonly bool    $sandbox      = false,
+        /** Nome da loja exibido ao cliente no app Nubank */
+        private readonly ?string $merchantName = null,
+        /**
+         * URL de callback global para receber notificações de status.
+         * Pode ser sobrescrita por pagamento via metadata['callbackUrl'].
+         */
+        private readonly ?string $callbackUrl  = null,
     ) {
-        if (!$sandbox && $certPath === null) {
-            throw new \InvalidArgumentException(
-                'NuBank: certPath é obrigatório em produção (mTLS). Forneça o caminho do certificado .pem.'
-            );
-        }
-
-        $this->baseUrl  = $sandbox ? self::SANDBOX_URL  : self::PRODUCTION_URL;
-        $this->oauthUrl = $sandbox ? self::OAUTH_SANDBOX_URL : self::OAUTH_URL;
+        $this->baseUrl = $sandbox ? self::SANDBOX_URL : self::PRODUCTION_URL;
     }
 
-    // ===========================================================
-    //  AUTENTICAÇÃO OAuth2 (Client Credentials)
-    // ===========================================================
-
-    /**
-     * Obtém (ou renova) o access token OAuth2.
-     * O token é armazenado em memória e reutilizado até 60 s antes de expirar.
-     */
-    private function getAccessToken(): string
-    {
-        if ($this->accessToken && $this->tokenExpiry && time() < ($this->tokenExpiry - 60)) {
-            return $this->accessToken;
-        }
-
-        $ch = curl_init($this->oauthUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => http_build_query([
-                'grant_type'    => 'client_credentials',
-                'client_id'     => $this->clientId,
-                'client_secret' => $this->clientSecret,
-                'scope'         => 'payments pix boleto transfers',
-            ]),
-            CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
-        ]);
-
-        $this->applyCert($ch);
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
-        curl_close($ch);
-
-        $data = json_decode($response, true);
-
-        if ($httpCode !== 200 || !isset($data['access_token'])) {
-            throw new GatewayException(
-                'NuBank: falha na autenticação OAuth2 — ' . ($data['error_description'] ?? 'sem detalhes'),
-                $httpCode
-            );
-        }
-
-        $this->accessToken = $data['access_token'];
-        $this->tokenExpiry = time() + (int) ($data['expires_in'] ?? 3600);
-
-        return $this->accessToken;
-    }
-
-    // ===========================================================
+    // ==================================================================
     //  HTTP CLIENT
-    // ===========================================================
+    // ==================================================================
 
     /**
-     * Executa uma requisição HTTP autenticada à API NuBank.
+     * Executa uma requisição autenticada à API NuPay.
      *
-     * @param string               $method  GET | POST | PUT | PATCH | DELETE
-     * @param string               $path    Caminho do endpoint (ex.: /pix/v2/cob/txid)
-     * @param array<string, mixed> $body    Payload JSON (para POST/PUT/PATCH)
-     * @param array<string, mixed> $query   Query string params
+     * Autenticação: X-Merchant-Key + X-Merchant-Token em todos os requests.
+     * NÃO usa OAuth2. NÃO usa Bearer token.
      *
+     * @param  string               $method  GET | POST
+     * @param  string               $path    Ex.: /v1/checkouts/payments
+     * @param  array<string, mixed> $body    Payload JSON (apenas para POST)
      * @return array<string, mixed>
      * @throws GatewayException
      */
-    private function request(
-        string $method,
-        string $path,
-        array  $body  = [],
-        array  $query = []
-    ): array {
+    private function request(string $method, string $path, array $body = []): array
+    {
         $url = $this->baseUrl . $path;
-
-        if (!empty($query)) {
-            $url .= '?' . http_build_query($query);
-        }
 
         $headers = [
             'Content-Type: application/json',
             'Accept: application/json',
-            'Authorization: Bearer ' . $this->getAccessToken(),
+            'X-Merchant-Key: '   . $this->merchantKey,
+            'X-Merchant-Token: ' . $this->merchantToken,
         ];
 
         $ch = curl_init($url);
         curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER  => true,
-            CURLOPT_CUSTOMREQUEST   => strtoupper($method),
-            CURLOPT_HTTPHEADER      => $headers,
-            CURLOPT_TIMEOUT         => 30,
-            CURLOPT_CONNECTTIMEOUT  => 10,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST  => strtoupper($method),
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TIMEOUT        => 30,
+            CURLOPT_CONNECTTIMEOUT => 10,
         ]);
 
-        if (!empty($body) && in_array(strtoupper($method), ['POST', 'PUT', 'PATCH'])) {
+        if (!empty($body) && strtoupper($method) === 'POST') {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
         }
-
-        $this->applyCert($ch);
 
         $response  = curl_exec($ch);
         $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -203,1057 +139,605 @@ class NuBankGateway implements PaymentGatewayInterface
         curl_close($ch);
 
         if ($response === false) {
-            throw new GatewayException("NuBank: erro cURL — {$curlError}", 0);
+            throw new GatewayException("NuPay: erro de conexão — {$curlError}", 0);
         }
 
         $decoded = json_decode($response, true) ?? [];
 
         if ($httpCode >= 400) {
-            $msg = $decoded['message'] ?? $decoded['error'] ?? 'Requisição falhou';
-            throw new GatewayException("NuBank: {$msg}", $httpCode, null, ['response' => $decoded]);
+            $msg = $decoded['message'] ?? $decoded['error'] ?? "HTTP {$httpCode}";
+            throw new GatewayException("NuPay: {$msg}", $httpCode, null, ['response' => $decoded]);
         }
 
         return $decoded;
     }
 
-    /**
-     * Aplica o certificado mTLS ao handle cURL (obrigatório em produção).
-     */
-    private function applyCert(\CurlHandle $ch): void
-    {
-        if ($this->certPath) {
-            curl_setopt($ch, CURLOPT_SSLCERT, $this->certPath);
-            if ($this->certPassword) {
-                curl_setopt($ch, CURLOPT_SSLCERTPASSWD, $this->certPassword);
-            }
-        }
-    }
-
-    // ===========================================================
-    //  HELPERS
-    // ===========================================================
+    // ==================================================================
+    //  HELPER — mapear status NuPay → PaymentStatus interno
+    // ==================================================================
 
     /**
-     * Gera um txid aleatório para cobranças PIX.
-     * Padrão BACEN: [a-zA-Z0-9]{26,35}
-     * Usa random_bytes para garantia criptográfica.
+     * Status documentados pela API NuPay for Business:
+     *
+     * Pagamento : WAITING_PAYMENT_METHOD | AUTHORIZED | COMPLETED | CANCELLED | ERROR
+     * Cancelamento: CANCELLING | CANCELLED | DENIED | ERROR
+     * Estorno   : OPEN | REFUNDING | ERROR
      */
-    private function generateTxId(): string
+    private function mapStatus(string $nuPayStatus): PaymentStatus
     {
-        $chars  = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        $max    = strlen($chars) - 1;
-        $length = random_int(26, 35);
-        $txId   = '';
-        for ($i = 0; $i < $length; $i++) {
-            $txId .= $chars[random_int(0, $max)];
-        }
-        return $txId;
-    }
-
-    /** Mapeia status da API NuBank para o enum interno PaymentStatus. */
-    private function mapStatus(string $nuStatus): PaymentStatus
-    {
-        return match (strtoupper($nuStatus)) {
-            'ATIVA', 'PENDING', 'CREATED'      => PaymentStatus::PENDING,
-            'CONCLUIDA', 'PAID', 'APPROVED'    => PaymentStatus::APPROVED,
-            'PROCESSING'                        => PaymentStatus::PROCESSING,
-            'CANCELLED', 'REMOVIDA'             => PaymentStatus::CANCELLED,
-            'EXPIRED'                           => PaymentStatus::EXPIRED,
-            'FAILED', 'DENIED'                 => PaymentStatus::FAILED,
-            'REFUNDED'                          => PaymentStatus::REFUNDED,
-            default                             => PaymentStatus::PENDING,
+        return match (strtoupper($nuPayStatus)) {
+            'WAITING_PAYMENT_METHOD',
+            'WAITING_FOR_PAYMENT_METHOD' => PaymentStatus::PENDING,
+            'AUTHORIZED'                 => PaymentStatus::PROCESSING,
+            'COMPLETED'                  => PaymentStatus::APPROVED,
+            'CANCELLING'                 => PaymentStatus::PROCESSING,
+            'CANCELLED'                  => PaymentStatus::CANCELLED,
+            'DENIED'                     => PaymentStatus::FAILED,
+            'OPEN', 'REFUNDING'          => PaymentStatus::PROCESSING,
+            'ERROR'                      => PaymentStatus::FAILED,
+            default                      => PaymentStatus::PENDING,
         };
     }
 
-    // ===========================================================
-    //  PIX
-    // ===========================================================
+    // ==================================================================
+    //  ✅  CRIAR PAGAMENTO NUPAY
+    //      POST /v1/checkouts/payments
+    //
+    //  O NuPay usa PixPaymentRequest como veículo de dados pois é o
+    //  tipo de request de pagamento mais próximo estruturalmente.
+    //  O campo pixKey NÃO é usado — NuPay não é PIX.
+    //
+    //  Campos obrigatórios via metadata:
+    //    metadata['merchantOrderReference'] — ID único do pedido na sua loja
+    //    metadata['referenceId']            — UUID único por pagamento
+    //
+    //  Campos opcionais via metadata:
+    //    metadata['returnUrl']        — redirecionar após pagamento aprovado
+    //    metadata['cancelUrl']        — redirecionar se cliente cancelar no app
+    //    metadata['storeName']        — nome da filial/loja
+    //    metadata['delayToAutoCancel']— minutos até auto-cancelar (padrão: 30)
+    //    metadata['authorizationType']— 'manually_authorized' (padrão) ou OAuth2
+    //    metadata['items']            — array de itens do pedido
+    //    metadata['shipping']         — dados de frete
+    //    metadata['billingAddress']   — endereço de cobrança
+    //    metadata['callbackUrl']      — sobrescreve o callbackUrl do construtor
+    //    metadata['recipients']       — beneficiários finais (Circular BCB 3.978/2020)
+    //
+    //  A resposta contém rawResponse['_paymentUrl']:
+    //  REDIRECIONE o cliente para essa URL para abrir o app Nubank.
+    // ==================================================================
 
     public function createPixPayment(PixPaymentRequest $request): PaymentResponse
     {
-        if (empty($request->pixKey)) {
-            throw new \InvalidArgumentException('NuBank: pixKey é obrigatório para criar cobranças PIX.');
+        $meta = $request->metadata ?? [];
+
+        if (empty($meta['merchantOrderReference'])) {
+            throw new \InvalidArgumentException(
+                'NuPay: metadata[merchantOrderReference] é obrigatório e deve ser único por loja.'
+            );
         }
 
-        $txId = $this->generateTxId();
-
-        $data = [
-            'calendario'         => ['expiracao' => 172800],  // 48 h
-            'valor'              => [
-                'original' => number_format($request->getAmount(), 2, '.', ''),
-            ],
-            'chave'              => $request->pixKey,
-            'solicitacaoPagador' => $request->description ?? 'Pagamento via PIX',
-        ];
-
-        if ($request->customerName && $request->getCustomerDocument()) {
-            $doc     = preg_replace('/\D/', '', $request->getCustomerDocument());
-            $docType = strlen($doc) === 11 ? 'cpf' : 'cnpj';
-            $data['devedor'] = [$docType => $doc, 'nome' => $request->customerName];
+        if (empty($meta['referenceId'])) {
+            throw new \InvalidArgumentException(
+                'NuPay: metadata[referenceId] é obrigatório e deve ser único por pagamento (use UUID v4).'
+            );
         }
 
-        $response = $this->request('PUT', "/pix/v2/cob/{$txId}", $data);
+        // Separar primeiro nome e sobrenome do customerName
+        $nameParts = explode(' ', trim($request->customerName ?? ''), 2);
+        $firstName = $nameParts[0] ?? '';
+        $lastName  = $nameParts[1] ?? '';
 
-        return PaymentResponse::create(
-            success:       isset($response['txid']),
-            transactionId: $response['txid'] ?? $txId,
-            status:        $this->mapStatus($response['status'] ?? 'ATIVA'),
-            amount:        $request->getAmount(),
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            pixCopyPaste:  $response['pixCopiaECola'] ?? null,
-            rawResponse:   $response,
-        );
-    }
+        $doc     = preg_replace('/\D/', '', $request->getCustomerDocument() ?? '');
+        $docType = strlen($doc) === 14 ? 'CNPJ' : 'CPF';
 
-    public function getPixQrCode(string $transactionId): string
-    {
-        $response = $this->request('GET', "/pix/v2/cob/{$transactionId}");
-        return $response['qrcode'] ?? $response['imagemQrcode'] ?? '';
-    }
-
-    public function getPixCopyPaste(string $transactionId): string
-    {
-        $response = $this->request('GET', "/pix/v2/cob/{$transactionId}");
-        return $response['pixCopiaECola'] ?? '';
-    }
-
-    // ===========================================================
-    //  CARTÃO DE CRÉDITO
-    // ===========================================================
-
-    public function createCreditCardPayment(CreditCardPaymentRequest $request): PaymentResponse
-    {
-        $data = [
-            'amount'       => (int) round($request->getAmount() * 100),
-            'currency'     => 'BRL',
-            'description'  => $request->description ?? 'Pagamento com cartão',
-            'capture'      => $request->capture ?? true,
-            'installments' => $request->installments ?? 1,
-            'customer'     => [
-                'name'   => $request->customerName ?? '',
-                'email'  => $request->customerEmail ?? '',
-                'tax_id' => preg_replace('/\D/', '', $request->getCustomerDocument() ?? ''),
+        $body = [
+            'merchantOrderReference' => (string) $meta['merchantOrderReference'],
+            'referenceId'            => (string) $meta['referenceId'],
+            'amount' => [
+                'value'    => $request->getAmount(),
+                'currency' => 'BRL',
             ],
+            'paymentMethod' => [
+                'type'              => 'nupay',
+                'authorizationType' => $meta['authorizationType'] ?? 'manually_authorized',
+            ],
+            'shopper' => [
+                'reference'    => $request->customerEmail ?? '',
+                'firstName'    => $firstName,
+                'lastName'     => $lastName,
+                'document'     => $doc,
+                'documentType' => $docType,
+                'email'        => $request->customerEmail ?? '',
+                'locale'       => 'pt-BR',
+            ],
+            'items' => $meta['items'] ?? [
+                [
+                    'id'          => '1',
+                    'description' => $request->description ?? 'Pedido',
+                    'value'       => $request->getAmount(),
+                    'quantity'    => 1,
+                ],
+            ],
+            'delayToAutoCancel' => max(1, (int) ($meta['delayToAutoCancel'] ?? 30)),
         ];
 
-        // Token tem prioridade — nunca enviar dados brutos se houver token
-        if (!empty($request->cardToken)) {
-            $data['card_token'] = $request->cardToken;
-        } else {
-            $data['card'] = [
-                'number'       => preg_replace('/\D/', '', $request->cardNumber ?? ''),
-                'holder_name'  => $request->cardHolderName ?? '',
-                'expiry_month' => $request->cardExpiryMonth ?? '',
-                'expiry_year'  => $request->cardExpiryYear ?? '',
-                'cvv'          => $request->cardCvv ?? '',
+        // URLs de redirecionamento pós-pagamento
+        if (!empty($meta['returnUrl']) || !empty($meta['cancelUrl'])) {
+            $body['paymentFlow'] = [
+                'returnUrl' => $meta['returnUrl'] ?? '',
+                'cancelUrl' => $meta['cancelUrl'] ?? '',
             ];
         }
 
-        $response = $this->request('POST', '/payments/v1/credit-card', $data);
-
-        return PaymentResponse::create(
-            success:       isset($response['id']) && in_array($response['status'] ?? '', ['approved', 'authorized']),
-            transactionId: $response['id'] ?? '',
-            status:        $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:        $request->getAmount(),
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
-        );
-    }
-
-    public function tokenizeCard(array $cardData): string
-    {
-        $response = $this->request('POST', '/payments/v1/cards/tokenize', [
-            'number'       => preg_replace('/\D/', '', $cardData['number'] ?? ''),
-            'holder_name'  => $cardData['holder_name'] ?? '',
-            'expiry_month' => $cardData['expiry_month'] ?? '',
-            'expiry_year'  => $cardData['expiry_year'] ?? '',
-            'cvv'          => $cardData['cvv'] ?? '',
-        ]);
-
-        if (!isset($response['token'])) {
-            throw new GatewayException('NuBank: tokenização de cartão falhou', 422);
+        if ($this->merchantName || !empty($meta['storeName'])) {
+            $body['merchantName'] = $this->merchantName ?? '';
+            $body['storeName']    = $meta['storeName'] ?? '';
         }
 
-        return $response['token'];
-    }
-
-    public function capturePreAuthorization(string $transactionId, ?float $amount = null): PaymentResponse
-    {
-        $data = $amount ? ['amount' => (int) round($amount * 100)] : [];
-
-        $response = $this->request('POST', "/payments/v1/credit-card/{$transactionId}/capture", $data);
-
-        return PaymentResponse::create(
-            success:       ($response['status'] ?? '') === 'approved',
-            transactionId: $transactionId,
-            status:        $this->mapStatus($response['status'] ?? 'APPROVED'),
-            amount:        $amount ?? 0,
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
-        );
-    }
-
-    public function cancelPreAuthorization(string $transactionId): PaymentResponse
-    {
-        $response = $this->request('POST', "/payments/v1/credit-card/{$transactionId}/void");
-
-        return PaymentResponse::create(
-            success:       true,
-            transactionId: $transactionId,
-            status:        PaymentStatus::CANCELLED,
-            amount:        0,
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
-        );
-    }
-
-    // ===========================================================
-    //  CARTÃO DE DÉBITO
-    // ===========================================================
-
-    public function createDebitCardPayment(DebitCardPaymentRequest $request): PaymentResponse
-    {
-        $data = [
-            'amount'      => (int) round($request->getAmount() * 100),
-            'currency'    => 'BRL',
-            'description' => $request->description ?? 'Pagamento débito',
-            'card'        => [
-                'number'       => preg_replace('/\D/', '', $request->cardNumber ?? ''),
-                'holder_name'  => $request->cardHolderName ?? '',
-                'expiry_month' => $request->cardExpiryMonth ?? '',
-                'expiry_year'  => $request->cardExpiryYear ?? '',
-                'cvv'          => $request->cardCvv ?? '',
-            ],
-            'customer'    => [
-                'name'   => $request->customerName ?? '',
-                'email'  => $request->customerEmail ?? '',
-                'tax_id' => preg_replace('/\D/', '', $request->getCustomerDocument() ?? ''),
-            ],
-        ];
-
-        $response = $this->request('POST', '/payments/v1/debit-card', $data);
-
-        return PaymentResponse::create(
-            success:       isset($response['id']),
-            transactionId: $response['id'] ?? '',
-            status:        $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:        $request->getAmount(),
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
-        );
-    }
-
-    // ===========================================================
-    //  BOLETO
-    // ===========================================================
-
-    public function createBoleto(BoletoPaymentRequest $request): PaymentResponse
-    {
-        $data = [
-            'amount'      => (int) round($request->getAmount() * 100),
-            'description' => $request->description ?? 'Boleto NuBank',
-            'due_date'    => $request->dueDate ?? date('Y-m-d', strtotime('+3 days')),
-            'customer'    => [
-                'name'   => $request->customerName ?? '',
-                'email'  => $request->customerEmail ?? '',
-                'tax_id' => preg_replace('/\D/', '', $request->getCustomerDocument() ?? ''),
-            ],
-        ];
-
-        if (!empty($request->customerAddress)) {
-            $data['customer']['address'] = [
-                'street'       => $request->customerAddress['street'] ?? '',
-                'number'       => $request->customerAddress['number'] ?? '',
-                'complement'   => $request->customerAddress['complement'] ?? '',
-                'neighborhood' => $request->customerAddress['neighborhood'] ?? '',
-                'city'         => $request->customerAddress['city'] ?? '',
-                'state'        => $request->customerAddress['state'] ?? '',
-                'postal_code'  => preg_replace('/\D/', '', $request->customerAddress['postal_code'] ?? ''),
-            ];
+        // callbackUrl: metadata tem prioridade sobre o construtor
+        $callbackUrl = $meta['callbackUrl'] ?? $this->callbackUrl;
+        if ($callbackUrl) {
+            $body['callbackUrl'] = $callbackUrl;
         }
 
-        $response = $this->request('POST', '/billing/v1/boletos', $data);
-
-        return PaymentResponse::create(
-            success:           isset($response['id']),
-            transactionId:     $response['id'] ?? '',
-            status:            $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:            $request->getAmount(),
-            currency:          Currency::BRL,
-            gatewayResponse:   $response,
-            boletoUrl:         $response['url'] ?? null,
-            boletoBarcode:     $response['barcode'] ?? null,
-            boletoDigitableLine: $response['digitable_line'] ?? null,
-            rawResponse:       $response,
-        );
-    }
-
-    public function getBoletoUrl(string $transactionId): string
-    {
-        $response = $this->request('GET', "/billing/v1/boletos/{$transactionId}");
-
-        if (!isset($response['url'])) {
-            throw new GatewayException('NuBank: URL do boleto não encontrada', 404);
+        if (!empty($meta['shipping'])) {
+            $body['shipping'] = $meta['shipping'];
         }
 
-        return $response['url'];
-    }
+        if (!empty($meta['billingAddress'])) {
+            $body['billingAddress'] = $meta['billingAddress'];
+        }
 
-    public function cancelBoleto(string $transactionId): PaymentResponse
-    {
-        $response = $this->request('DELETE', "/billing/v1/boletos/{$transactionId}");
+        // Beneficiários finais (exigência BCB Circular 3.978/2020)
+        if (!empty($meta['recipients'])) {
+            $body['recipients'] = $meta['recipients'];
+        }
+
+        $response = $this->request('POST', '/v1/checkouts/payments', $body);
 
         return PaymentResponse::create(
-            success:       true,
-            transactionId: $transactionId,
-            status:        PaymentStatus::CANCELLED,
-            amount:        0,
-            currency:      Currency::BRL,
+            success:         isset($response['pspReferenceId']),
+            transactionId:   $response['pspReferenceId'] ?? '',
+            status:          $this->mapStatus($response['status'] ?? 'WAITING_PAYMENT_METHOD'),
+            amount:          $request->getAmount(),
+            currency:        Currency::BRL,
             gatewayResponse: $response,
-            rawResponse:   $response,
-        );
-    }
-
-    // ===========================================================
-    //  ASSINATURAS / RECORRÊNCIA
-    // ===========================================================
-
-    public function createSubscription(SubscriptionRequest $request): SubscriptionResponse
-    {
-        $data = [
-            'amount'      => (int) round($request->amount * 100),
-            'interval'    => strtolower($request->interval->value ?? 'monthly'),
-            'description' => $request->description ?? 'Assinatura',
-            'card_token'  => $request->cardToken ?? '',
-            'customer'    => [
-                'name'  => $request->customerName ?? '',
-                'email' => $request->customerEmail ?? '',
+            rawResponse: [
+                // ⬇  DADO MAIS IMPORTANTE: redirecione o cliente para esta URL
+                '_paymentUrl'        => $response['paymentUrl'] ?? null,
+                '_paymentMethodType' => $response['paymentMethodType'] ?? 'nupay',
+                '_referenceId'       => $response['referenceId'] ?? null,
+                '_pspReferenceId'    => $response['pspReferenceId'] ?? null,
+                '_status'            => $response['status'] ?? null,
+                '_raw'               => $response,
             ],
-        ];
-
-        $response = $this->request('POST', '/subscriptions/v1', $data);
-
-        return SubscriptionResponse::create(
-            success:        isset($response['id']),
-            subscriptionId: $response['id'] ?? '',
-            status:         $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:         $request->amount,
-            currency:       Currency::BRL,
-            rawResponse:    $response,
         );
     }
 
-    public function cancelSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        $response = $this->request('DELETE', "/subscriptions/v1/{$subscriptionId}");
-
-        return SubscriptionResponse::create(
-            success:        true,
-            subscriptionId: $subscriptionId,
-            status:         PaymentStatus::CANCELLED,
-            amount:         0,
-            currency:       Currency::BRL,
-            rawResponse:    $response,
-        );
-    }
-
-    public function suspendSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        $response = $this->request('POST', "/subscriptions/v1/{$subscriptionId}/suspend");
-
-        return SubscriptionResponse::create(
-            success:        isset($response['id']),
-            subscriptionId: $subscriptionId,
-            status:         $this->mapStatus($response['status'] ?? 'CANCELLED'),
-            amount:         0,
-            currency:       Currency::BRL,
-            rawResponse:    $response,
-        );
-    }
-
-    public function reactivateSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        $response = $this->request('POST', "/subscriptions/v1/{$subscriptionId}/reactivate");
-
-        return SubscriptionResponse::create(
-            success:        isset($response['id']),
-            subscriptionId: $subscriptionId,
-            status:         PaymentStatus::APPROVED,
-            amount:         0,
-            currency:       Currency::BRL,
-            rawResponse:    $response,
-        );
-    }
-
-    public function updateSubscription(string $subscriptionId, array $data): SubscriptionResponse
-    {
-        $response = $this->request('PATCH', "/subscriptions/v1/{$subscriptionId}", $data);
-
-        return SubscriptionResponse::create(
-            success:        isset($response['id']),
-            subscriptionId: $subscriptionId,
-            status:         $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:         ($response['amount'] ?? 0) / 100,
-            currency:       Currency::BRL,
-            rawResponse:    $response,
-        );
-    }
-
-    // ===========================================================
-    //  TRANSAÇÕES
-    // ===========================================================
+    // ==================================================================
+    //  ✅  CONSULTAR STATUS DO PAGAMENTO
+    //      GET /v1/checkouts/payments/{pspReferenceId}/status
+    // ==================================================================
 
     public function getTransactionStatus(string $transactionId): TransactionStatusResponse
     {
-        // Tenta buscar como PIX primeiro, depois como pagamento genérico
-        try {
-            $response = $this->request('GET', "/pix/v2/cob/{$transactionId}");
-
-            return TransactionStatusResponse::create(
-                success:       true,
-                transactionId: $transactionId,
-                status:        $this->mapStatus($response['status'] ?? 'PENDING'),
-                amount:        (float) ($response['valor']['original'] ?? 0),
-                currency:      Currency::BRL,
-                rawResponse:   $response,
-            );
-        } catch (GatewayException $e) {
-            if ($e->getCode() !== 404) {
-                throw $e;
-            }
-        }
-
-        // Fallback: pagamento por cartão ou boleto
-        $response = $this->request('GET', "/payments/v1/transactions/{$transactionId}");
+        $response = $this->request('GET', "/v1/checkouts/payments/{$transactionId}/status");
 
         return TransactionStatusResponse::create(
             success:       true,
-            transactionId: $transactionId,
-            status:        $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:        ($response['amount'] ?? 0) / 100,
+            transactionId: $response['pspReferenceId'] ?? $transactionId,
+            status:        $this->mapStatus($response['status'] ?? 'WAITING_PAYMENT_METHOD'),
+            amount:        (float) ($response['amount']['value'] ?? 0),
             currency:      Currency::BRL,
             rawResponse:   $response,
         );
     }
 
-    public function listTransactions(array $filters = []): array
+    // ==================================================================
+    //  ✅  CANCELAR PAGAMENTO NÃO PAGO
+    //      POST /v1/checkouts/payments/{pspReferenceId}/cancel
+    //      Só funciona para status WAITING_PAYMENT_METHOD.
+    //      Para pagamentos já pagos, use refund().
+    // ==================================================================
+
+    public function cancelBoleto(string $transactionId): PaymentResponse
     {
-        $query = [
-            'start_date' => $filters['start_date'] ?? date('Y-m-d', strtotime('-30 days')),
-            'end_date'   => $filters['end_date']   ?? date('Y-m-d'),
-        ];
+        $response = $this->request('POST', "/v1/checkouts/payments/{$transactionId}/cancel");
 
-        if (isset($filters['status'])) {
-            $query['status'] = $filters['status'];
-        }
-        if (isset($filters['page'])) {
-            $query['page'] = (int) $filters['page'];
-        }
-
-        $response = $this->request('GET', '/payments/v1/transactions', [], $query);
-        return $response['data'] ?? $response;
+        return PaymentResponse::create(
+            success:         in_array($response['status'] ?? '', ['CANCELLING', 'CANCELLED'], true),
+            transactionId:   $response['pspReferenceId'] ?? $transactionId,
+            status:          $this->mapStatus($response['status'] ?? 'CANCELLED'),
+            amount:          0,
+            currency:        Currency::BRL,
+            gatewayResponse: $response,
+            rawResponse:     $response,
+        );
     }
 
-    // ===========================================================
-    //  ESTORNOS E CHARGEBACKS
-    // ===========================================================
+    // ==================================================================
+    //  ✅  ESTORNO TOTAL OU PARCIAL
+    //      POST /v1/checkouts/payments/{pspReferenceId}/refunds
+    //      Estornos parciais são suportados.
+    //      A soma dos estornos não pode ultrapassar o valor total.
+    // ==================================================================
 
     public function refund(RefundRequest $request): RefundResponse
     {
-        $data = ['reason' => $request->reason ?? 'Solicitação do cliente'];
+        $body = [
+            'amount'              => [
+                'value'    => $request->amount ?? 0,
+                'currency' => 'BRL',
+            ],
+            'transactionRefundId' => uniqid('refund_', true),
+            'notes'               => $request->reason ?? '',
+        ];
 
-        if ($request->amount) {
-            $data['amount'] = (int) round($request->amount * 100);
-        }
-
-        $response = $this->request('POST', "/payments/v1/transactions/{$request->transactionId}/refund", $data);
+        $response = $this->request(
+            'POST',
+            "/v1/checkouts/payments/{$request->transactionId}/refunds",
+            $body
+        );
 
         return RefundResponse::create(
-            success:       isset($response['id']),
-            refundId:      $response['id'] ?? '',
+            success:       in_array($response['status'] ?? '', ['REFUNDING', 'OPEN'], true),
+            refundId:      $response['refundId'] ?? '',
             transactionId: $request->transactionId,
-            amount:        ($response['amount'] ?? 0) / 100,
-            status:        $this->mapStatus($response['status'] ?? 'REFUNDED')->value,
+            amount:        $request->amount ?? 0,
+            status:        $this->mapStatus($response['status'] ?? 'REFUNDING')->value,
             rawResponse:   $response,
         );
     }
 
     public function partialRefund(string $transactionId, float $amount): RefundResponse
     {
-        $response = $this->request('POST', "/payments/v1/transactions/{$transactionId}/refund", [
-            'amount' => (int) round($amount * 100),
-        ]);
+        $body = [
+            'amount'              => ['value' => $amount, 'currency' => 'BRL'],
+            'transactionRefundId' => uniqid('partial_refund_', true),
+        ];
+
+        $response = $this->request('POST', "/v1/checkouts/payments/{$transactionId}/refunds", $body);
 
         return RefundResponse::create(
-            success:       isset($response['id']),
-            refundId:      $response['id'] ?? '',
+            success:       in_array($response['status'] ?? '', ['REFUNDING', 'OPEN'], true),
+            refundId:      $response['refundId'] ?? '',
             transactionId: $transactionId,
             amount:        $amount,
-            status:        $this->mapStatus($response['status'] ?? 'REFUNDED')->value,
+            status:        $this->mapStatus($response['status'] ?? 'REFUNDING')->value,
             rawResponse:   $response,
         );
     }
+
+    // ==================================================================
+    //  ✅  CONSULTAR STATUS DE UM ESTORNO
+    //      GET /v1/checkouts/payments/{pspReferenceId}/refunds/{refundId}
+    //      Use: getChargebacks(['pspReferenceId' => '...', 'refundId' => '...'])
+    // ==================================================================
 
     public function getChargebacks(array $filters = []): array
     {
-        $response = $this->request('GET', '/payments/v1/chargebacks', [], $filters);
-        return $response['data'] ?? [];
+        if (!empty($filters['pspReferenceId']) && !empty($filters['refundId'])) {
+            $response = $this->request(
+                'GET',
+                "/v1/checkouts/payments/{$filters['pspReferenceId']}/refunds/{$filters['refundId']}"
+            );
+            return [$response];
+        }
+
+        throw new GatewayException(
+            'NuPay: informe filters[pspReferenceId] e filters[refundId] para consultar um estorno. ' .
+            'Listagem geral de chargebacks não existe nesta API — use o Painel do Lojista NuPay for Business.',
+            501
+        );
     }
 
+    // ==================================================================
+    //  ❌  MÉTODOS NÃO SUPORTADOS
+    //      Padrão idêntico ao PayPal e EBANX no projeto.
+    //      Cada método lança GatewayException com explicação e alternativa.
+    // ==================================================================
+
+    /** @throws GatewayException sempre */
+    private function notSupported(string $feature, string $alternative = ''): never
+    {
+        $msg = "NuPay for Business não suporta {$feature}. "
+             . "O NuPay é exclusivo para pagamentos via app Nubank.";
+        if ($alternative) {
+            $msg .= " Use: {$alternative}.";
+        }
+        throw new GatewayException($msg, 501);
+    }
+
+    // PIX — NuPay e PIX são produtos completamente diferentes
+    public function getPixQrCode(string $transactionId): string
+    {
+        $this->notSupported('PIX QR Code', 'C6Bank, Asaas, PagarMe, Banco do Brasil');
+    }
+
+    public function getPixCopyPaste(string $transactionId): string
+    {
+        $this->notSupported('PIX Copia e Cola', 'C6Bank, Asaas, PagarMe, Banco do Brasil');
+    }
+
+    // Cartão de crédito
+    public function createCreditCardPayment(CreditCardPaymentRequest $request): PaymentResponse
+    {
+        $this->notSupported('cartão de crédito', 'Asaas, PagarMe, C6Bank, Adyen, Stripe');
+    }
+
+    public function tokenizeCard(array $cardData): string
+    {
+        $this->notSupported('tokenização de cartão', 'Asaas, PagarMe, C6Bank, Adyen, Stripe');
+    }
+
+    public function capturePreAuthorization(string $transactionId, ?float $amount = null): PaymentResponse
+    {
+        $this->notSupported('pré-autorização de cartão', 'Asaas, PagarMe, C6Bank, Adyen');
+    }
+
+    public function cancelPreAuthorization(string $transactionId): PaymentResponse
+    {
+        $this->notSupported('cancelamento de pré-autorização', 'Asaas, PagarMe, C6Bank, Adyen');
+    }
+
+    // Cartão de débito
+    public function createDebitCardPayment(DebitCardPaymentRequest $request): PaymentResponse
+    {
+        $this->notSupported('cartão de débito', 'Asaas, PagarMe, C6Bank');
+    }
+
+    // Boleto — cancelBoleto() foi reaproveitado para cancelar pedido NuPay não pago
+    public function createBoleto(BoletoPaymentRequest $request): PaymentResponse
+    {
+        $this->notSupported('boleto bancário', 'Asaas, PagarMe, C6Bank, Banco do Brasil');
+    }
+
+    public function getBoletoUrl(string $transactionId): string
+    {
+        $this->notSupported('boleto bancário', 'Asaas, PagarMe, C6Bank, Banco do Brasil');
+    }
+
+    // Assinaturas
+    public function createSubscription(SubscriptionRequest $request): SubscriptionResponse
+    {
+        $this->notSupported('assinaturas/recorrência', 'Asaas, PagarMe, C6Bank');
+    }
+
+    public function cancelSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        $this->notSupported('assinaturas/recorrência', 'Asaas, PagarMe, C6Bank');
+    }
+
+    public function suspendSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        $this->notSupported('assinaturas/recorrência', 'Asaas, PagarMe, C6Bank');
+    }
+
+    public function reactivateSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        $this->notSupported('assinaturas/recorrência', 'Asaas, PagarMe, C6Bank');
+    }
+
+    public function updateSubscription(string $subscriptionId, array $data): SubscriptionResponse
+    {
+        $this->notSupported('assinaturas/recorrência', 'Asaas, PagarMe, C6Bank');
+    }
+
+    // Listagem de transações
+    public function listTransactions(array $filters = []): array
+    {
+        $this->notSupported(
+            'listagem de transações',
+            'use a Conciliation API: docs.nupaybusiness.com.br/checkout/sellers/conciliation-api/openapi'
+        );
+    }
+
+    // Chargebacks
     public function disputeChargeback(string $chargebackId, array $evidence): PaymentResponse
     {
-        $response = $this->request('POST', "/payments/v1/chargebacks/{$chargebackId}/dispute", [
-            'evidence' => $evidence,
-        ]);
-
-        return PaymentResponse::create(
-            success:       isset($response['id']),
-            transactionId: $response['id'] ?? $chargebackId,
-            status:        $this->mapStatus($response['status'] ?? 'PROCESSING'),
-            amount:        0,
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
-        );
+        $this->notSupported('disputa de chargeback via API', 'Painel do Lojista NuPay for Business');
     }
 
-    // ===========================================================
-    //  SPLIT DE PAGAMENTO
-    // ===========================================================
-
+    // Split — NuPay suporta "recipients" na criação, mas não split independente
     public function createSplitPayment(SplitPaymentRequest $request): PaymentResponse
     {
-        $splits = array_map(fn($r) => [
-            'recipient_id' => $r['recipient_id'],
-            'amount'       => (int) round($r['amount'] * 100),
-        ], $request->recipients ?? []);
-
-        $response = $this->request('POST', '/payments/v1/split', [
-            'amount'      => (int) round($request->totalAmount * 100),
-            'description' => $request->description ?? 'Split payment',
-            'splits'      => $splits,
-        ]);
-
-        return PaymentResponse::create(
-            success:       isset($response['id']),
-            transactionId: $response['id'] ?? '',
-            status:        $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:        $request->totalAmount,
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
+        $this->notSupported(
+            'split de pagamento como endpoint independente',
+            'passe metadata[recipients] em createPixPayment() para definir beneficiários finais'
         );
     }
 
-    // ===========================================================
-    //  SUB-CONTAS
-    // ===========================================================
-
+    // Sub-contas
     public function createSubAccount(SubAccountRequest $request): SubAccountResponse
     {
-        $response = $this->request('POST', '/accounts/v1/sub-accounts', [
-            'name'  => $request->name,
-            'email' => $request->email ?? '',
-            'tax_id'=> preg_replace('/\D/', '', $request->taxId ?? ''),
-        ]);
-
-        return SubAccountResponse::create(
-            success:      isset($response['id']),
-            subAccountId: $response['id'] ?? '',
-            status:       $this->mapStatus($response['status'] ?? 'PENDING'),
-            rawResponse:  $response,
-        );
+        $this->notSupported('sub-contas', 'Asaas, PagarMe, C6Bank');
     }
 
     public function updateSubAccount(string $subAccountId, array $data): SubAccountResponse
     {
-        $response = $this->request('PATCH', "/accounts/v1/sub-accounts/{$subAccountId}", $data);
-
-        return SubAccountResponse::create(
-            success:      isset($response['id']),
-            subAccountId: $subAccountId,
-            status:       $this->mapStatus($response['status'] ?? 'APPROVED'),
-            rawResponse:  $response,
-        );
+        $this->notSupported('sub-contas', 'Asaas, PagarMe, C6Bank');
     }
 
     public function getSubAccount(string $subAccountId): SubAccountResponse
     {
-        $response = $this->request('GET', "/accounts/v1/sub-accounts/{$subAccountId}");
-
-        return SubAccountResponse::create(
-            success:      isset($response['id']),
-            subAccountId: $subAccountId,
-            status:       $this->mapStatus($response['status'] ?? 'APPROVED'),
-            rawResponse:  $response,
-        );
+        $this->notSupported('sub-contas', 'Asaas, PagarMe, C6Bank');
     }
 
     public function activateSubAccount(string $subAccountId): SubAccountResponse
     {
-        $response = $this->request('POST', "/accounts/v1/sub-accounts/{$subAccountId}/activate");
-
-        return SubAccountResponse::create(
-            success:      true,
-            subAccountId: $subAccountId,
-            status:       PaymentStatus::APPROVED,
-            rawResponse:  $response,
-        );
+        $this->notSupported('sub-contas', 'Asaas, PagarMe, C6Bank');
     }
 
     public function deactivateSubAccount(string $subAccountId): SubAccountResponse
     {
-        $response = $this->request('POST', "/accounts/v1/sub-accounts/{$subAccountId}/deactivate");
-
-        return SubAccountResponse::create(
-            success:      true,
-            subAccountId: $subAccountId,
-            status:       PaymentStatus::CANCELLED,
-            rawResponse:  $response,
-        );
+        $this->notSupported('sub-contas', 'Asaas, PagarMe, C6Bank');
     }
 
-    // ===========================================================
-    //  WALLETS
-    // ===========================================================
-
+    // Wallets
     public function createWallet(WalletRequest $request): WalletResponse
     {
-        $response = $this->request('POST', '/wallets/v1', [
-            'owner_id'    => $request->ownerId ?? '',
-            'description' => $request->description ?? 'Carteira NuBank',
-        ]);
-
-        return WalletResponse::create(
-            success:    isset($response['id']),
-            walletId:   $response['id'] ?? '',
-            balance:    ($response['balance'] ?? 0) / 100,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('wallets', 'C6Bank, Asaas');
     }
 
     public function addBalance(string $walletId, float $amount): WalletResponse
     {
-        $response = $this->request('POST', "/wallets/v1/{$walletId}/credit", [
-            'amount' => (int) round($amount * 100),
-        ]);
-
-        return WalletResponse::create(
-            success:    true,
-            walletId:   $walletId,
-            balance:    ($response['balance'] ?? 0) / 100,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('wallets', 'C6Bank, Asaas');
     }
 
     public function deductBalance(string $walletId, float $amount): WalletResponse
     {
-        $response = $this->request('POST', "/wallets/v1/{$walletId}/debit", [
-            'amount' => (int) round($amount * 100),
-        ]);
-
-        return WalletResponse::create(
-            success:    true,
-            walletId:   $walletId,
-            balance:    ($response['balance'] ?? 0) / 100,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('wallets', 'C6Bank, Asaas');
     }
 
     public function getWalletBalance(string $walletId): BalanceResponse
     {
-        $response = $this->request('GET', "/wallets/v1/{$walletId}");
-
-        return BalanceResponse::create(
-            success:  true,
-            balance:  ($response['balance'] ?? 0) / 100,
-            currency: Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('wallets', 'C6Bank, Asaas');
     }
 
     public function transferBetweenWallets(string $fromWalletId, string $toWalletId, float $amount): TransferResponse
     {
-        $response = $this->request('POST', '/wallets/v1/transfer', [
-            'from_wallet_id' => $fromWalletId,
-            'to_wallet_id'   => $toWalletId,
-            'amount'         => (int) round($amount * 100),
-        ]);
-
-        return TransferResponse::create(
-            success:    isset($response['id']),
-            transferId: $response['id'] ?? '',
-            status:     $this->mapStatus($response['status'] ?? 'APPROVED'),
-            amount:     $amount,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('wallets', 'C6Bank, Asaas');
     }
 
-    // ===========================================================
-    //  ESCROW (CUSTÓDIA)
-    // ===========================================================
-
+    // Escrow
     public function holdInEscrow(EscrowRequest $request): EscrowResponse
     {
-        $response = $this->request('POST', '/escrow/v1/hold', [
-            'amount'      => (int) round($request->amount * 100),
-            'description' => $request->description ?? 'Custódia NuBank',
-            'expires_at'  => $request->expiresAt ?? date('Y-m-d\TH:i:s\Z', strtotime('+7 days')),
-        ]);
-
-        return EscrowResponse::create(
-            success:   isset($response['id']),
-            escrowId:  $response['id'] ?? '',
-            status:    $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:    $request->amount,
-            currency:  Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('escrow/custódia', 'C6Bank, PagarMe');
     }
 
     public function releaseEscrow(string $escrowId): EscrowResponse
     {
-        $response = $this->request('POST', "/escrow/v1/{$escrowId}/release");
-
-        return EscrowResponse::create(
-            success:   true,
-            escrowId:  $escrowId,
-            status:    PaymentStatus::APPROVED,
-            amount:    0,
-            currency:  Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('escrow/custódia', 'C6Bank, PagarMe');
     }
 
     public function partialReleaseEscrow(string $escrowId, float $amount): EscrowResponse
     {
-        $response = $this->request('POST', "/escrow/v1/{$escrowId}/partial-release", [
-            'amount' => (int) round($amount * 100),
-        ]);
-
-        return EscrowResponse::create(
-            success:   true,
-            escrowId:  $escrowId,
-            status:    PaymentStatus::APPROVED,
-            amount:    $amount,
-            currency:  Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('escrow/custódia', 'C6Bank, PagarMe');
     }
 
     public function cancelEscrow(string $escrowId): EscrowResponse
     {
-        $response = $this->request('DELETE', "/escrow/v1/{$escrowId}");
-
-        return EscrowResponse::create(
-            success:   true,
-            escrowId:  $escrowId,
-            status:    PaymentStatus::CANCELLED,
-            amount:    0,
-            currency:  Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('escrow/custódia', 'C6Bank, PagarMe');
     }
 
-    // ===========================================================
-    //  TRANSFERÊNCIAS
-    // ===========================================================
-
+    // Transferências
     public function transfer(TransferRequest $request): TransferResponse
     {
-        $data = [
-            'amount'         => (int) round($request->amount * 100),
-            'description'    => $request->description ?? 'Transferência NuBank',
-            'recipient_name' => $request->recipientName ?? '',
-            'pix_key'        => $request->metadata['pix_key'] ?? null,
-        ];
-
-        $response = $this->request('POST', '/transfers/v1', $data);
-
-        return TransferResponse::create(
-            success:    isset($response['id']),
-            transferId: $response['id'] ?? '',
-            status:     $this->mapStatus($response['status'] ?? 'PROCESSING'),
-            amount:     $request->amount,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('transferências', 'C6Bank, Banco do Brasil, Asaas');
     }
 
-    public function scheduleTransfer(TransferRequest $request, string $scheduledFor): TransferResponse
+    public function scheduleTransfer(TransferRequest $request, string $date): TransferResponse
     {
-        $data = [
-            'amount'         => (int) round($request->amount * 100),
-            'description'    => $request->description ?? 'Transferência agendada',
-            'recipient_name' => $request->recipientName ?? '',
-            'scheduled_for'  => $scheduledFor,
-            'pix_key'        => $request->metadata['pix_key'] ?? null,
-        ];
-
-        $response = $this->request('POST', '/transfers/v1/scheduled', $data);
-
-        return TransferResponse::create(
-            success:    isset($response['id']),
-            transferId: $response['id'] ?? '',
-            status:     $this->mapStatus($response['status'] ?? 'PENDING'),
-            amount:     $request->amount,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('transferências agendadas', 'C6Bank, Banco do Brasil');
     }
 
     public function cancelScheduledTransfer(string $transferId): TransferResponse
     {
-        $response = $this->request('DELETE', "/transfers/v1/scheduled/{$transferId}");
-
-        return TransferResponse::create(
-            success:    true,
-            transferId: $transferId,
-            status:     PaymentStatus::CANCELLED,
-            amount:     0,
-            currency:   Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('transferências agendadas', 'C6Bank, Banco do Brasil');
     }
 
-    // ===========================================================
-    //  SALDO E EXTRATO
-    // ===========================================================
-
-    public function getBalance(): BalanceResponse
+    // Links de pagamento
+    public function createPaymentLink(PaymentLinkRequest $request): PaymentLinkResponse
     {
-        $response = $this->request('GET', '/accounts/v1/balance');
-
-        return BalanceResponse::create(
-            success:     true,
-            balance:     ($response['available'] ?? 0) / 100,
-            currency:    Currency::BRL,
-            rawResponse: $response,
-        );
+        $this->notSupported('links de pagamento', 'Asaas, PagarMe, C6Bank');
     }
 
-    public function getStatement(array $filters = []): array
+    public function getPaymentLink(string $linkId): PaymentLinkResponse
     {
-        $query = [
-            'start_date' => $filters['start_date'] ?? date('Y-m-d', strtotime('-30 days')),
-            'end_date'   => $filters['end_date']   ?? date('Y-m-d'),
-        ];
-
-        $response = $this->request('GET', '/accounts/v1/statement', [], $query);
-        return $response['entries'] ?? $response['data'] ?? [];
+        $this->notSupported('links de pagamento', 'Asaas, PagarMe, C6Bank');
     }
 
-    // ===========================================================
-    //  CLIENTES
-    // ===========================================================
+    public function expirePaymentLink(string $linkId): PaymentLinkResponse
+    {
+        $this->notSupported('links de pagamento', 'Asaas, PagarMe, C6Bank');
+    }
 
+    // Clientes — dados do shopper vão junto à criação do pagamento
     public function createCustomer(CustomerRequest $request): CustomerResponse
     {
-        $response = $this->request('POST', '/customers/v1', [
-            'name'   => $request->name ?? '',
-            'email'  => $request->email ?? '',
-            'tax_id' => preg_replace('/\D/', '', $request->taxId ?? ''),
-            'phone'  => preg_replace('/\D/', '', $request->phone ?? ''),
-        ]);
-
-        return CustomerResponse::create(
-            success:    isset($response['id']),
-            customerId: $response['id'] ?? '',
-            rawResponse: $response,
-        );
-    }
-
-    public function getCustomer(string $customerId): CustomerResponse
-    {
-        $response = $this->request('GET', "/customers/v1/{$customerId}");
-
-        return CustomerResponse::create(
-            success:    isset($response['id']),
-            customerId: $customerId,
-            rawResponse: $response,
+        $this->notSupported(
+            'gestão de clientes como recurso separado',
+            'os dados do cliente (shopper) são enviados na criação de cada pagamento'
         );
     }
 
     public function updateCustomer(string $customerId, array $data): CustomerResponse
     {
-        $response = $this->request('PATCH', "/customers/v1/{$customerId}", $data);
+        $this->notSupported('gestão de clientes como recurso separado');
+    }
 
-        return CustomerResponse::create(
-            success:    isset($response['id']),
-            customerId: $customerId,
-            rawResponse: $response,
-        );
+    public function getCustomer(string $customerId): CustomerResponse
+    {
+        $this->notSupported('gestão de clientes como recurso separado');
     }
 
     public function listCustomers(array $filters = []): array
     {
-        $response = $this->request('GET', '/customers/v1', [], $filters);
-        return $response['data'] ?? [];
+        $this->notSupported('gestão de clientes como recurso separado');
     }
 
-    // ===========================================================
-    //  LINKS DE PAGAMENTO
-    // ===========================================================
-
-    public function createPaymentLink(PaymentLinkRequest $request): PaymentLinkResponse
-    {
-        $response = $this->request('POST', '/payment-links/v1', [
-            'amount'      => (int) round($request->amount * 100),
-            'description' => $request->description ?? 'Link de Pagamento',
-            'expires_at'  => $request->expiresAt ?? date('Y-m-d\TH:i:s\Z', strtotime('+7 days')),
-        ]);
-
-        return PaymentLinkResponse::create(
-            success:       isset($response['id']),
-            paymentLinkId: $response['id'] ?? '',
-            url:           $response['url'] ?? '',
-            expiresAt:     $response['expires_at'] ?? '',
-            rawResponse:   $response,
-        );
-    }
-
-    public function expirePaymentLink(string $paymentLinkId): PaymentLinkResponse
-    {
-        $response = $this->request('POST', "/payment-links/v1/{$paymentLinkId}/expire");
-
-        return PaymentLinkResponse::create(
-            success:       true,
-            paymentLinkId: $paymentLinkId,
-            url:           '',
-            expiresAt:     '',
-            rawResponse:   $response,
-        );
-    }
-
-    public function getPaymentLink(string $linkId): PaymentLinkResponse
-    {
-        $response = $this->request('GET', "/payment-links/v1/{$linkId}");
-
-        return PaymentLinkResponse::create(
-            success:       isset($response['id']),
-            paymentLinkId: $response['id'] ?? $linkId,
-            url:           $response['url'] ?? '',
-            expiresAt:     $response['expires_at'] ?? '',
-            rawResponse:   $response,
-        );
-    }
-
-    // ===========================================================
-    //  WEBHOOKS
-    // ===========================================================
-
-    public function registerWebhook(string $url, array $events): array
-    {
-        return $this->request('POST', '/webhooks/v1', [
-            'url'    => $url,
-            'events' => $events,
-        ]);
-    }
-
-    public function listWebhooks(): array
-    {
-        $response = $this->request('GET', '/webhooks/v1');
-        return $response['data'] ?? [];
-    }
-
-    public function deleteWebhook(string $webhookId): bool
-    {
-        $this->request('DELETE', "/webhooks/v1/{$webhookId}");
-        return true;
-    }
-
-    // ===========================================================
-    //  ANTIFRAUDE
-    // ===========================================================
-
-    /**
-     * Consulta análise de risco de uma transação.
-     * NuBank retorna score e flags de fraude embutidos na resposta do pagamento.
-     */
+    // Antifraude — análise interna do Nubank, não exposta via API
     public function analyzeTransaction(string $transactionId): array
     {
-        $response = $this->request('GET', "/payments/v1/transactions/{$transactionId}");
-
-        return [
-            'transaction_id' => $transactionId,
-            'risk_score'     => $response['risk_score'] ?? null,
-            'risk_level'     => $response['risk_level'] ?? 'unknown',
-            'fraud_flags'    => $response['fraud_flags'] ?? [],
-            'status'         => $response['status'] ?? null,
-            'raw'            => $response,
-        ];
+        $this->notSupported(
+            'análise de antifraude via API',
+            'a análise é feita internamente pelo Nubank de forma automática e transparente'
+        );
     }
 
-    /**
-     * Adiciona identificador à blacklist interna NuBank.
-     * Tipos aceitos: 'cpf', 'cnpj', 'email', 'ip', 'card_bin'.
-     */
     public function addToBlacklist(string $identifier, string $type): bool
     {
-        $this->request('POST', '/antifraud/v1/blacklist', [
-            'identifier' => $identifier,
-            'type'       => $type,
-        ]);
-
-        return true;
+        $this->notSupported('blacklist via API', 'Painel do Lojista NuPay for Business');
     }
 
     public function removeFromBlacklist(string $identifier, string $type): bool
     {
-        $this->request('DELETE', '/antifraud/v1/blacklist', [
-            'identifier' => $identifier,
-            'type'       => $type,
-        ]);
-
-        return true;
+        $this->notSupported('blacklist via API', 'Painel do Lojista NuPay for Business');
     }
 
-    // ===========================================================
-    //  SALDO E CONCILIAÇÃO
-    // ===========================================================
+    // Webhooks — configurados via callbackUrl na criação ou no Painel
+    public function registerWebhook(string $url, array $events): array
+    {
+        $this->notSupported(
+            'registro de webhooks via API',
+            'passe callbackUrl no construtor do gateway ou em metadata[callbackUrl] por pagamento. ' .
+            'Configuração global é feita no Painel do Lojista NuPay for Business.'
+        );
+    }
 
-    /**
-     * Retorna agenda de liquidação (D+1, D+2...) dos recebíveis.
-     */
+    public function listWebhooks(): array
+    {
+        $this->notSupported('listagem de webhooks via API', 'Painel do Lojista NuPay for Business');
+    }
+
+    public function deleteWebhook(string $webhookId): bool
+    {
+        $this->notSupported('remoção de webhooks via API', 'Painel do Lojista NuPay for Business');
+    }
+
+    // Saldo — liquidação automática em D+1 útil, sem necessidade de saque
+    public function getBalance(): BalanceResponse
+    {
+        $this->notSupported(
+            'consulta de saldo via API',
+            'liquidação é automática em D+1 útil. Consulte o Painel do Lojista NuPay for Business.'
+        );
+    }
+
     public function getSettlementSchedule(array $filters = []): array
     {
-        $query = [
-            'start_date' => $filters['start_date'] ?? date('Y-m-d'),
-            'end_date'   => $filters['end_date']   ?? date('Y-m-d', strtotime('+30 days')),
-        ];
-
-        $response = $this->request('GET', '/accounts/v1/settlement-schedule', [], $query);
-        return $response['schedule'] ?? $response['data'] ?? [];
+        $this->notSupported(
+            'agenda de liquidação via esta API',
+            'use a Conciliation API: docs.nupaybusiness.com.br/checkout/sellers/conciliation-api/openapi'
+        );
     }
 
-    /**
-     * Solicita antecipação de recebíveis.
-     * NuBank BaaS pode não suportar este endpoint — lança GatewayException com instrução clara.
-     */
     public function anticipateReceivables(array $transactionIds): PaymentResponse
     {
-        $response = $this->request('POST', '/accounts/v1/receivables/anticipate', [
-            'transaction_ids' => $transactionIds,
-        ]);
-
-        return PaymentResponse::create(
-            success:       isset($response['id']),
-            transactionId: $response['id'] ?? '',
-            status:        $this->mapStatus($response['status'] ?? 'PROCESSING'),
-            amount:        ($response['amount'] ?? 0) / 100,
-            currency:      Currency::BRL,
-            gatewayResponse: $response,
-            rawResponse:   $response,
+        $this->notSupported(
+            'antecipação de recebíveis',
+            'NuPay liquida automaticamente em D+1 útil — não há antecipação disponível'
         );
     }
 }
