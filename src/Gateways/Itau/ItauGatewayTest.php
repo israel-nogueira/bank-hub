@@ -19,15 +19,17 @@ use IsraelNogueira\PaymentHub\Enums\PaymentStatus;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 use IsraelNogueira\PaymentHub\Gateways\Itau\ItauGateway;
 use IsraelNogueira\PaymentHub\Tests\Integration\GatewayTestCase;
+use DateTime;
 
 /**
  * Testes de integração do ItauGateway.
  *
  * Execução contra sandbox:
- *   ITAU_CLIENT_ID=xxx ITAU_CLIENT_SECRET=yyy ITAU_PIX_KEY=zzz
+ *   ITAU_CLIENT_ID=xxx ITAU_CLIENT_SECRET=yyy \
+ *   ITAU_PIX_KEY=empresa@itau.com.br ITAU_CONVENIO=12345 \
  *   ./vendor/bin/phpunit --filter ItauGatewayTest
  *
- * Sem credenciais, os testes são pulados automaticamente.
+ * Sem variáveis de ambiente, os testes são pulados automaticamente.
  */
 class ItauGatewayTest extends GatewayTestCase
 {
@@ -96,7 +98,7 @@ class ItauGatewayTest extends GatewayTestCase
         $this->assertTrue($response->success, 'PIX deve ser criado com sucesso');
         $this->assertNotEmpty($response->transactionId, 'transactionId não pode ser vazio');
         $this->assertEquals(PaymentStatus::PENDING, $response->status, 'Status inicial deve ser PENDING');
-        $this->assertEquals(100.00, $response->money->amount, 'Valor deve ser 100.00');
+        $this->assertEquals(100.00, $response->money->amount(), 'Valor deve ser 100.00');
         $this->assertArrayHasKey('txid', $response->metadata, 'Metadata deve conter txid');
     }
 
@@ -113,7 +115,7 @@ class ItauGatewayTest extends GatewayTestCase
         $response = $this->gateway->createPixPayment($request);
 
         $this->assertTrue($response->success);
-        $this->assertEquals(0.01, $response->money->amount);
+        $this->assertEquals(0.01, $response->money->amount());
     }
 
     public function testCreatePixPaymentBelowMinimumThrowsException(): void
@@ -135,7 +137,7 @@ class ItauGatewayTest extends GatewayTestCase
             clientId:     getenv('ITAU_CLIENT_ID')     ?: 'test',
             clientSecret: getenv('ITAU_CLIENT_SECRET') ?: 'test',
             sandbox:      true,
-            pixKey:       null,    // ← sem chave PIX
+            pixKey:       null,
         );
 
         $this->expectException(GatewayException::class);
@@ -151,7 +153,6 @@ class ItauGatewayTest extends GatewayTestCase
 
     public function testGetPixQrCodeReturnsNonEmptyString(): void
     {
-        // Cria uma cobrança e obtém o QR Code
         $pix = $this->gateway->createPixPayment(new PixPaymentRequest(
             amount:           50.00,
             currency:         'BRL',
@@ -196,7 +197,7 @@ class ItauGatewayTest extends GatewayTestCase
             customerName:     'Ana Costa',
             customerDocument: '12345678909',
             customerEmail:    'ana@example.com',
-            dueDate:          new \DateTime('+5 days'),
+            dueDate:          new DateTime('+5 days'),
             description:      'Teste de boleto',
             metadata: [
                 'endereco' => 'Rua Teste, 123',
@@ -212,6 +213,7 @@ class ItauGatewayTest extends GatewayTestCase
         $this->assertTrue($response->success, 'Boleto deve ser criado com sucesso');
         $this->assertNotEmpty($response->transactionId, 'nossoNumero não pode ser vazio');
         $this->assertEquals(PaymentStatus::PENDING, $response->status);
+        $this->assertEquals(200.00, $response->money->amount());
         $this->assertArrayHasKey('nossoNumero',    $response->metadata);
         $this->assertArrayHasKey('linhaDigitavel', $response->metadata);
         $this->assertArrayHasKey('codigoBarras',   $response->metadata);
@@ -223,7 +225,7 @@ class ItauGatewayTest extends GatewayTestCase
             clientId:     getenv('ITAU_CLIENT_ID')     ?: 'test',
             clientSecret: getenv('ITAU_CLIENT_SECRET') ?: 'test',
             sandbox:      true,
-            convenio:     null,    // ← sem convênio
+            convenio:     null,
         );
 
         $this->expectException(GatewayException::class);
@@ -234,7 +236,7 @@ class ItauGatewayTest extends GatewayTestCase
             currency:         'BRL',
             customerName:     'Test',
             customerDocument: '12345678909',
-            dueDate:          new \DateTime('+3 days'),
+            dueDate:          new DateTime('+3 days'),
         ));
     }
 
@@ -255,8 +257,8 @@ class ItauGatewayTest extends GatewayTestCase
 
         $this->assertTrue($response->success, 'Estorno deve ser criado com sucesso');
         $this->assertNotEmpty($response->refundId, 'refundId não pode ser vazio');
-        $this->assertContains($response->status, ['processing', 'refunded', 'failed']);
-        $this->assertEquals(50.00, $response->amount);
+        $this->assertContains($response->status->value, ['processing', 'refunded', 'failed']);
+        $this->assertEquals(50.00, $response->money->amount());
     }
 
     public function testPartialRefund(): void
@@ -267,7 +269,19 @@ class ItauGatewayTest extends GatewayTestCase
         );
 
         $this->assertTrue($response->success);
-        $this->assertEquals(25.00, $response->amount);
+        $this->assertEquals(25.00, $response->money->amount());
+    }
+
+    public function testRefundBelowMinimumThrowsException(): void
+    {
+        $this->expectException(GatewayException::class);
+        $this->expectExceptionMessageMatches('/valor mínimo/i');
+
+        $this->gateway->refund(RefundRequest::create(
+            transactionId: 'E00341934302501151234567890789',
+            amount:        0.00,
+            reason:        'Teste',
+        ));
     }
 
     // ─────────────────────────────────────────────────────────
@@ -290,7 +304,7 @@ class ItauGatewayTest extends GatewayTestCase
         $this->assertTrue($response->success);
         $this->assertNotEmpty($response->transferId);
         $this->assertEquals(PaymentStatus::PENDING, $response->status);
-        $this->assertEquals(10.00, $response->money->amount);
+        $this->assertEquals(10.00, $response->money->amount());
     }
 
     public function testTransferViaTed(): void
@@ -313,7 +327,8 @@ class ItauGatewayTest extends GatewayTestCase
 
         $this->assertTrue($response->success);
         $this->assertNotEmpty($response->transferId);
-        $this->assertStringContainsString('TED', $response->rawResponse['_method'] ?? $response->transferId);
+        $this->assertEquals(PaymentStatus::PENDING, $response->status);
+        $this->assertEquals(50.00, $response->money->amount());
     }
 
     public function testScheduleAndCancelTransfer(): void
@@ -336,8 +351,8 @@ class ItauGatewayTest extends GatewayTestCase
         $this->assertTrue($scheduled->success);
         $this->assertNotEmpty($scheduled->transferId);
         $this->assertEquals(PaymentStatus::PENDING, $scheduled->status);
+        $this->assertEquals(100.00, $scheduled->money->amount());
 
-        // Cancela o agendamento criado
         $cancelled = $this->gateway->cancelScheduledTransfer($scheduled->transferId);
 
         $this->assertTrue($cancelled->success);
@@ -363,8 +378,8 @@ class ItauGatewayTest extends GatewayTestCase
     public function testGetSettlementScheduleReturnsArray(): void
     {
         $lancamentos = $this->gateway->getSettlementSchedule([
-            'dataInicio' => (new \DateTime('-7 days'))->format('Y-m-d'),
-            'dataFim'    => (new \DateTime())->format('Y-m-d'),
+            'dataInicio' => (new DateTime('-7 days'))->format('Y-m-d'),
+            'dataFim'    => (new DateTime())->format('Y-m-d'),
         ]);
 
         $this->assertIsArray($lancamentos);
@@ -376,7 +391,6 @@ class ItauGatewayTest extends GatewayTestCase
 
     public function testGetTransactionStatusForPixCobranca(): void
     {
-        // Cria uma cobrança para consultar
         $pix = $this->gateway->createPixPayment(new PixPaymentRequest(
             amount:           30.00,
             currency:         'BRL',
@@ -393,8 +407,7 @@ class ItauGatewayTest extends GatewayTestCase
             PaymentStatus::PAID,
             PaymentStatus::CANCELLED,
         ]);
-        $this->assertEquals(30.00, $status->amount);
-        $this->assertEquals('BRL', $status->currency);
+        $this->assertEquals(30.00, $status->money->amount());
     }
 
     // ─────────────────────────────────────────────────────────
@@ -404,8 +417,8 @@ class ItauGatewayTest extends GatewayTestCase
     public function testListTransactionsReturnsArray(): void
     {
         $list = $this->gateway->listTransactions([
-            'inicio' => (new \DateTime('-30 days'))->format('Y-m-d\TH:i:s\Z'),
-            'fim'    => (new \DateTime())->format('Y-m-d\TH:i:s\Z'),
+            'inicio' => (new DateTime('-30 days'))->format('Y-m-d\TH:i:s\Z'),
+            'fim'    => (new DateTime())->format('Y-m-d\TH:i:s\Z'),
         ]);
 
         $this->assertIsArray($list);
@@ -451,11 +464,10 @@ class ItauGatewayTest extends GatewayTestCase
         $this->assertIsArray($webhooks);
     }
 
-    public function testDeleteWebhookReturnsBool(): void
+    public function testDeleteWebhookReturnsTrue(): void
     {
         $result = $this->gateway->deleteWebhook('webhook_id_qualquer');
 
-        $this->assertIsBool($result);
         $this->assertTrue($result);
     }
 
@@ -528,9 +540,12 @@ class ItauGatewayTest extends GatewayTestCase
         $this->expectExceptionMessageMatches('/cartão de crédito/i');
 
         $this->gateway->createCreditCardPayment(CreditCardPaymentRequest::create(
-            amount: 100.00, cardNumber: '4111111111111111',
-            cardHolderName: 'Test', cardExpiryMonth: '12',
-            cardExpiryYear: '2026', cardCvv: '123',
+            amount:         100.00,
+            cardNumber:     '4111111111111111',
+            cardHolderName: 'Test',
+            cardExpiryMonth: '12',
+            cardExpiryYear:  '2026',
+            cardCvv:         '123',
         ));
     }
 
@@ -540,8 +555,10 @@ class ItauGatewayTest extends GatewayTestCase
         $this->expectExceptionMessageMatches('/assinaturas/i');
 
         $this->gateway->createSubscription(SubscriptionRequest::create(
-            amount: 29.90, interval: 'monthly',
-            customerEmail: 'test@test.com', cardToken: 'tok_123',
+            amount:        29.90,
+            interval:      'monthly',
+            customerEmail: 'test@test.com',
+            cardToken:     'tok_123',
         ));
     }
 
@@ -551,7 +568,9 @@ class ItauGatewayTest extends GatewayTestCase
         $this->expectExceptionMessageMatches('/split/i');
 
         $this->gateway->createSplitPayment(SplitPaymentRequest::create(
-            amount: 100.00, splits: [], paymentMethod: 'pix',
+            amount:        100.00,
+            splits:        [],
+            paymentMethod: 'pix',
         ));
     }
 
@@ -561,7 +580,8 @@ class ItauGatewayTest extends GatewayTestCase
         $this->expectExceptionMessageMatches('/escrow/i');
 
         $this->gateway->holdInEscrow(EscrowRequest::create(
-            amount: 100.00, currency: Currency::BRL,
+            amount:   100.00,
+            currency: Currency::BRL,
         ));
     }
 

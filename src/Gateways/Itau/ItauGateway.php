@@ -33,6 +33,8 @@ use IsraelNogueira\PaymentHub\Enums\Currency;
 use IsraelNogueira\PaymentHub\Enums\PaymentStatus;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 use IsraelNogueira\PaymentHub\ValueObjects\Money;
+use DateTime;
+use DateTimeInterface;
 
 /**
  * ╔══════════════════════════════════════════════════════════════╗
@@ -51,7 +53,7 @@ use IsraelNogueira\PaymentHub\ValueObjects\Money;
  * │  ✅ Agendamento e cancelamento de transferências          │
  * │  ✅ Consulta de saldo                                     │
  * │  ✅ Extrato da conta corrente                             │
- * │  ✅ Webhooks (PIX e Boleto)                               │
+ * │  ✅ Webhooks (PIX)                                        │
  * │  ✅ Gestão de Clientes                                    │
  * │  ❌ Cartão de Crédito (use Adyen, Stripe ou PagarMe)      │
  * │  ❌ Cartão de Débito  (use PagarMe ou C6Bank)             │
@@ -80,7 +82,7 @@ use IsraelNogueira\PaymentHub\ValueObjects\Money;
  * 5. Para produção: certificado mTLS (ICP-Brasil .pfx) registrado no portal
  *
  * @author  PaymentHub
- * @version 1.0.0
+ * @version 1.1.0
  *
  * @see https://devportal.itau.com.br/documentacao
  */
@@ -100,14 +102,14 @@ class ItauGateway implements PaymentGatewayInterface
     private const PATH_CONTA    = '/conta-corrente/v1';
     private const PATH_TRANSFER = '/pagamentos/v1';
 
-    /** Valor mínimo aceito para cobranças (R$ 0,01). */
+    /** Valor mínimo aceito para cobranças e estornos (R$ 0,01). */
     private const AMOUNT_MIN = 0.01;
 
     /** Máximo de tentativas em erros transitórios (429 / 503). */
     private const MAX_RETRIES = 3;
 
     // ─────────────────────────────────────────────────────────
-    //  Propriedades
+    //  Estado interno
     // ─────────────────────────────────────────────────────────
 
     private string  $baseUrl;
@@ -148,6 +150,9 @@ class ItauGateway implements PaymentGatewayInterface
      *
      * Endpoint: PUT /pix/v2/cob/{txid}
      *
+     * O txid é gerado deterministicamente a partir de um UUID v4 sem hífens
+     * para garantir unicidade e conformidade BACEN (26–35 chars alfanuméricos).
+     *
      * @throws GatewayException
      */
     public function createPixPayment(PixPaymentRequest $request): PaymentResponse
@@ -162,24 +167,38 @@ class ItauGateway implements PaymentGatewayInterface
             throw new GatewayException('Itaú PIX: pixKey não configurada no construtor.');
         }
 
-        // txid: 26–35 caracteres alfanuméricos (sem traços/hífens)
-        $txid = substr(preg_replace('/[^a-zA-Z0-9]/', '', uniqid('itau', true)), 0, 35);
+        // txid: 26–35 caracteres alfanuméricos (sem traços/hífens) — BACEN v2
+        $txid = substr(
+            str_replace('-', '', sprintf('%04x%04x%04x%04x%04x%04x%04x%04x',
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+                mt_rand(0, 0xffff),
+                mt_rand(0, 0x0fff) | 0x4000,
+                mt_rand(0, 0x3fff) | 0x8000,
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+            )),
+            0,
+            35
+        );
+
+        $doc     = preg_replace('/\D/', '', (string) $request->customerDocument);
+        $isLegal = strlen($doc) > 11;
 
         $payload = [
             'calendario' => [
                 'expiracao' => (int) ($request->metadata['expiracao'] ?? 3600),
             ],
             'devedor' => [
-                'cpf'  => preg_replace('/\D/', '', $request->customerDocument),
-                'nome' => $request->customerName,
+                $isLegal ? 'cnpj' : 'cpf' => $doc,
+                'nome'                     => $request->customerName,
             ],
             'valor' => [
                 'original' => number_format($request->amount, 2, '.', ''),
             ],
-            'chave'               => $this->pixKey,
-            'solicitacaoPagador'  => $request->description ?? 'Pagamento via PIX',
+            'chave'              => $this->pixKey,
+            'solicitacaoPagador' => $request->description ?? 'Pagamento via PIX',
         ];
 
+        // Informações adicionais opcionais (array de {nome, valor})
         if (!empty($request->metadata['infoAdicionais'])) {
             $payload['infoAdicionais'] = $request->metadata['infoAdicionais'];
         }
@@ -188,7 +207,7 @@ class ItauGateway implements PaymentGatewayInterface
 
         return new PaymentResponse(
             success:       true,
-            transactionId: $response['txid'] ?? $txid,
+            transactionId: (string) ($response['txid'] ?? $txid),
             status:        PaymentStatus::PENDING,
             money:         Money::from($request->amount, Currency::BRL),
             message:       'Cobrança PIX criada com sucesso.',
@@ -196,7 +215,7 @@ class ItauGateway implements PaymentGatewayInterface
             metadata: [
                 'location' => $response['location'] ?? null,
                 'pixKey'   => $this->pixKey,
-                'txid'     => $txid,
+                'txid'     => $response['txid'] ?? $txid,
             ],
         );
     }
@@ -212,13 +231,17 @@ class ItauGateway implements PaymentGatewayInterface
     {
         $cob   = $this->request('GET', self::PATH_PIX . '/cob/' . $transactionId);
         $locId = $cob['loc']['id']
-            ?? throw new GatewayException('Itaú PIX: loc.id não encontrado na cobrança ' . $transactionId);
+            ?? throw new GatewayException(
+                'Itaú PIX: loc.id não encontrado na cobrança ' . $transactionId
+            );
 
         $qr = $this->request('GET', self::PATH_PIX . '/loc/' . $locId . '/qrcode');
 
         return $qr['imagemQrcode']
             ?? $qr['qrcode']
-            ?? throw new GatewayException('Itaú PIX: QR Code não retornado para loc ' . $locId);
+            ?? throw new GatewayException(
+                'Itaú PIX: QR Code não retornado para loc ' . $locId
+            );
     }
 
     /**
@@ -230,12 +253,16 @@ class ItauGateway implements PaymentGatewayInterface
     {
         $cob   = $this->request('GET', self::PATH_PIX . '/cob/' . $transactionId);
         $locId = $cob['loc']['id']
-            ?? throw new GatewayException('Itaú PIX: loc.id não encontrado na cobrança ' . $transactionId);
+            ?? throw new GatewayException(
+                'Itaú PIX: loc.id não encontrado na cobrança ' . $transactionId
+            );
 
         $qr = $this->request('GET', self::PATH_PIX . '/loc/' . $locId . '/qrcode');
 
         return $qr['qrcode']
-            ?? throw new GatewayException('Itaú PIX: Copia e Cola não disponível para loc ' . $locId);
+            ?? throw new GatewayException(
+                'Itaú PIX: Copia e Cola não disponível para loc ' . $locId
+            );
     }
 
     // ══════════════════════════════════════════════════════════
@@ -255,12 +282,13 @@ class ItauGateway implements PaymentGatewayInterface
             throw new GatewayException('Itaú Boleto: convenio não configurado no construtor.');
         }
 
-        $doc     = preg_replace('/\D/', '', $request->customerDocument);
+        $doc     = preg_replace('/\D/', '', (string) $request->customerDocument);
         $dueDate = $request->dueDate
             ? $request->dueDate->format('Y-m-d')
-            : (new \DateTime('+3 days'))->format('Y-m-d');
+            : (new DateTime('+3 days'))->format('Y-m-d');
 
-        $nossoNumero = $request->metadata['nossoNumero'] ?? (string) random_int(10000000000, 99999999999);
+        $nossoNumero = $request->metadata['nossoNumero']
+            ?? (string) random_int(10_000_000_000, 99_999_999_999);
 
         $payload = [
             'etapa_processo_boleto' => 'EFETIVACAO',
@@ -271,7 +299,7 @@ class ItauGateway implements PaymentGatewayInterface
                 'valor_total_titulo'             => number_format($request->amount, 2, '.', ''),
                 'codigo_especie'                 => $request->metadata['especie'] ?? 'DUPLICATA_MERCANTIL',
                 'valor_abatimento'               => '0.00',
-                'data_emissao'                   => (new \DateTime())->format('Y-m-d'),
+                'data_emissao'                   => (new DateTime())->format('Y-m-d'),
                 'data_vencimento'                => $dueDate,
                 'pagador' => [
                     'pessoa' => [
@@ -289,13 +317,13 @@ class ItauGateway implements PaymentGatewayInterface
                         'nome_bairro'     => $request->metadata['bairro']   ?? 'Não informado',
                         'nome_cidade'     => $request->metadata['cidade']   ?? 'São Paulo',
                         'sigla_UF'        => $request->metadata['uf']       ?? 'SP',
-                        'numero_CEP'      => preg_replace('/\D/', '', $request->metadata['cep'] ?? '01310100'),
+                        'numero_CEP'      => preg_replace('/\D/', '', (string) ($request->metadata['cep'] ?? '01310100')),
                     ],
                 ],
                 'beneficiario_final' => [
                     'id_beneficiario' => $this->convenio,
                 ],
-                'texto_uso_beneficiario'       => $request->description ?? 'Pagamento de serviço',
+                'texto_uso_beneficiario'  => $request->description ?? 'Pagamento de serviço',
                 'dados_individuais_boleto' => [
                     [
                         'numero_nosso_numero' => $nossoNumero,
@@ -309,8 +337,10 @@ class ItauGateway implements PaymentGatewayInterface
 
         $response = $this->request('POST', self::PATH_BOLETO . '/boletos', $payload);
 
-        $returnedNossoNumero = $response['dado_boleto']['dados_individuais_boleto'][0]['numero_nosso_numero']
-            ?? $nossoNumero;
+        $returnedNossoNumero = (string) (
+            $response['dado_boleto']['dados_individuais_boleto'][0]['numero_nosso_numero']
+            ?? $nossoNumero
+        );
 
         return new PaymentResponse(
             success:       true,
@@ -375,51 +405,58 @@ class ItauGateway implements PaymentGatewayInterface
 
     /**
      * Consulta o status de uma transação (PIX ou Boleto).
-     * Tenta PIX primeiro, com fallback automático para Boleto.
+     *
+     * Tenta PIX primeiro (GET /pix/v2/cob/{txid}).
+     * Só faz fallback para Boleto quando a API retorna HTTP 404.
+     * Qualquer outro erro (401, 500, rede…) é propagado imediatamente.
      *
      * @throws GatewayException
      */
     public function getTransactionStatus(string $transactionId): TransactionStatusResponse
     {
+        // ── Tenta como cobrança PIX ─────────────────────────────
         try {
             $response = $this->request('GET', self::PATH_PIX . '/cob/' . $transactionId);
 
-            $statusMap = [
-                'ATIVA'                           => PaymentStatus::PENDING,
-                'CONCLUIDA'                       => PaymentStatus::PAID,
-                'REMOVIDA_PELO_USUARIO_RECEBEDOR' => PaymentStatus::CANCELLED,
-                'REMOVIDA_PELO_PSP'               => PaymentStatus::CANCELLED,
-            ];
+            $status = match (strtoupper((string) ($response['status'] ?? ''))) {
+                'CONCLUIDA'                        => PaymentStatus::PAID,
+                'REMOVIDA_PELO_USUARIO_RECEBEDOR',
+                'REMOVIDA_PELO_PSP'                => PaymentStatus::CANCELLED,
+                default                            => PaymentStatus::PENDING,
+            };
 
-            return new TransactionStatusResponse(
+            return TransactionStatusResponse::create(
                 success:       true,
                 transactionId: $transactionId,
-                status:        $statusMap[$response['status'] ?? ''] ?? PaymentStatus::PENDING,
+                status:        $status->value,
                 amount:        (float) ($response['valor']['original'] ?? 0),
                 currency:      'BRL',
-                message:       $response['status'] ?? 'Consultado',
                 rawResponse:   $response,
             );
-        } catch (GatewayException) {
-            // Fallback para boleto
+        } catch (GatewayException $e) {
+            // FIX: só silencia HTTP 404 (cobrança não encontrada como PIX).
+            // Qualquer outro código (401, 500, rede…) deve ser propagado.
+            if ($e->getCode() !== 404) {
+                throw $e;
+            }
         }
 
+        // ── Fallback: tenta como boleto ─────────────────────────
         $response = $this->request('GET', self::PATH_BOLETO . '/boletos/' . $transactionId);
 
-        $statusBoleto = match ($response['situacao'] ?? '') {
-            'VENCIDO'   => PaymentStatus::EXPIRED,
+        $status = match (strtoupper((string) ($response['situacao'] ?? ''))) {
             'LIQUIDADO' => PaymentStatus::PAID,
             'BAIXADO'   => PaymentStatus::CANCELLED,
+            'VENCIDO'   => PaymentStatus::EXPIRED,
             default     => PaymentStatus::PENDING,
         };
 
-        return new TransactionStatusResponse(
+        return TransactionStatusResponse::create(
             success:       true,
             transactionId: $transactionId,
-            status:        $statusBoleto,
+            status:        $status->value,
             amount:        (float) ($response['dado_boleto']['valor_total_titulo'] ?? 0),
             currency:      'BRL',
-            message:       $response['situacao'] ?? 'Consultado',
             rawResponse:   $response,
         );
     }
@@ -434,13 +471,14 @@ class ItauGateway implements PaymentGatewayInterface
     public function listTransactions(array $filters = []): array
     {
         $query = [
-            'inicio' => $filters['inicio'] ?? (new \DateTime('-30 days'))->format('Y-m-d\TH:i:s\Z'),
-            'fim'    => $filters['fim']    ?? (new \DateTime())->format('Y-m-d\TH:i:s\Z'),
+            'inicio' => $filters['inicio'] ?? (new DateTime('-30 days'))->format('Y-m-d\TH:i:s\Z'),
+            'fim'    => $filters['fim']    ?? (new DateTime())->format('Y-m-d\TH:i:s\Z'),
         ];
 
         if (!empty($filters['cpf'])) {
             $query['cpf'] = preg_replace('/\D/', '', $filters['cpf']);
         }
+
         if (!empty($filters['cnpj'])) {
             $query['cnpj'] = preg_replace('/\D/', '', $filters['cnpj']);
         }
@@ -459,15 +497,32 @@ class ItauGateway implements PaymentGatewayInterface
      *
      * Endpoint: PUT /pix/v2/pix/{e2eId}/devolucao/{id}
      *
+     * O devolucaoId é gerado deterministicamente a partir do e2eId + valor,
+     * garantindo idempotência em retries — o Itaú ignora tentativas com mesmo ID.
+     *
      * @throws GatewayException
      */
     public function refund(RefundRequest $request): RefundResponse
     {
-        $e2eId       = $request->metadata['e2eId'] ?? $request->transactionId;
-        $devolucaoId = substr(preg_replace('/[^a-zA-Z0-9]/', '', uniqid('dv', true)), 0, 35);
+        $amount = (float) ($request->amount ?? 0);
+
+        if ($amount < self::AMOUNT_MIN) {
+            throw new GatewayException(
+                sprintf('Itaú PIX: valor mínimo para devolução é R$ %.2f', self::AMOUNT_MIN)
+            );
+        }
+
+        $e2eId = (string) ($request->metadata['e2eId'] ?? $request->transactionId);
+
+        // ID determinístico: garante idempotência em caso de retry
+        $devolucaoId = substr(
+            hash('sha256', $e2eId . number_format($amount, 2, '.', '')),
+            0,
+            35
+        );
 
         $payload = [
-            'valor'     => number_format((float) ($request->amount ?? 0), 2, '.', ''),
+            'valor'     => number_format($amount, 2, '.', ''),
             'natureza'  => 'ORIGINAL',
             'descricao' => $request->reason ?? 'Estorno solicitado pelo recebedor',
         ];
@@ -478,25 +533,29 @@ class ItauGateway implements PaymentGatewayInterface
             $payload
         );
 
-        $statusMap = [
-            'EM_PROCESSAMENTO' => 'processing',
-            'DEVOLVIDO'        => 'refunded',
-            'NAO_REALIZADO'    => 'failed',
-        ];
+        $statusStr = match (strtoupper((string) ($response['status'] ?? ''))) {
+            'DEVOLVIDO'     => 'refunded',
+            'NAO_REALIZADO' => 'failed',
+            default         => 'processing',
+        };
 
-        return new RefundResponse(
+        return RefundResponse::create(
             success:       true,
-            refundId:      $response['id']    ?? $devolucaoId,
+            refundId:      (string) ($response['id'] ?? $devolucaoId),
             transactionId: $request->transactionId,
-            amount:        (float) ($response['valor'] ?? $request->amount ?? 0),
-            status:        $statusMap[$response['status'] ?? ''] ?? 'processing',
+            amount:        (float) ($response['valor'] ?? $amount),
+            status:        $statusStr,
+            currency:      'BRL',
             message:       'Devolução PIX iniciada.',
             rawResponse:   $response,
         );
     }
 
     /**
-     * Atalho para devolução parcial.
+     * Atalho para devolução parcial de um PIX.
+     *
+     * O sufixo 'partial' no hash diferencia o ID de um eventual full refund
+     * com mesmo e2eId + valor, garantindo idempotência independente.
      *
      * @throws GatewayException
      */
@@ -522,14 +581,15 @@ class ItauGateway implements PaymentGatewayInterface
      */
     public function transfer(TransferRequest $request): TransferResponse
     {
-        return ($request->metadata['method'] ?? 'pix') === 'ted'
+        return strtolower((string) ($request->metadata['method'] ?? 'pix')) === 'ted'
             ? $this->transferViaTed($request)
             : $this->transferViaPix($request);
     }
 
     /**
-     * Agenda uma transferência TED para uma data futura.
+     * Agenda uma transferência para uma data futura.
      *
+     * @param string $date Data no formato YYYY-MM-DD
      * @throws GatewayException
      */
     public function scheduleTransfer(TransferRequest $request, string $date): TransferResponse
@@ -540,21 +600,22 @@ class ItauGateway implements PaymentGatewayInterface
             'descricao'        => $request->description ?? 'Transferência agendada',
             'favorecido' => [
                 'nome'       => $request->recipientName,
-                'documento'  => preg_replace('/\D/', '', $request->metadata['recipientDocument'] ?? ''),
-                'banco'      => $request->metadata['bankCode']    ?? '',
-                'agencia'    => $request->metadata['agency']       ?? '',
-                'conta'      => $request->metadata['account']      ?? '',
-                'tipo_conta' => $request->metadata['accountType']  ?? 'corrente',
+                'documento'  => preg_replace('/\D/', '', (string) ($request->metadata['recipientDocument'] ?? '')),
+                'banco'      => $request->metadata['bankCode']   ?? '',
+                'agencia'    => $request->metadata['agency']     ?? '',
+                'conta'      => $request->metadata['account']    ?? '',
+                'tipo_conta' => $request->metadata['accountType'] ?? 'corrente',
             ],
         ];
 
         $response = $this->request('POST', self::PATH_CONTA . '/transferencias/agendadas', $payload);
 
-        return new TransferResponse(
+        return TransferResponse::create(
             success:     true,
-            transferId:  $response['id_agendamento'] ?? uniqid('SCHED_ITAU_'),
-            status:      PaymentStatus::PENDING,
-            money:       Money::from($request->amount, Currency::BRL),
+            transferId:  (string) ($response['id_agendamento'] ?? uniqid('SCHED_ITAU_')),
+            amount:      $request->amount,
+            status:      PaymentStatus::PENDING->value,
+            currency:    'BRL',
             message:     'Transferência agendada para ' . $date,
             rawResponse: $response,
         );
@@ -572,11 +633,12 @@ class ItauGateway implements PaymentGatewayInterface
             self::PATH_CONTA . '/transferencias/agendadas/' . $transferId
         );
 
-        return new TransferResponse(
+        return TransferResponse::create(
             success:     true,
             transferId:  $transferId,
-            status:      PaymentStatus::CANCELLED,
-            money:       null,
+            amount:      null,
+            status:      PaymentStatus::CANCELLED->value,
+            currency:    'BRL',
             message:     'Agendamento cancelado com sucesso.',
             rawResponse: $response,
         );
@@ -617,8 +679,8 @@ class ItauGateway implements PaymentGatewayInterface
     public function getSettlementSchedule(array $filters = []): array
     {
         $query = [
-            'dataInicio' => $filters['dataInicio'] ?? (new \DateTime('-30 days'))->format('Y-m-d'),
-            'dataFim'    => $filters['dataFim']    ?? (new \DateTime())->format('Y-m-d'),
+            'dataInicio' => $filters['dataInicio'] ?? (new DateTime('-30 days'))->format('Y-m-d'),
+            'dataFim'    => $filters['dataFim']    ?? (new DateTime())->format('Y-m-d'),
         ];
 
         if (!empty($filters['pagina'])) {
@@ -640,25 +702,26 @@ class ItauGateway implements PaymentGatewayInterface
      * Endpoint: PUT /pix/v2/webhook/{chave}
      *
      * @param string   $url    URL pública HTTPS
-     * @param string[] $events Eventos desejados (informativo; Itaú notifica todos)
+     * @param string[] $events Eventos desejados (informativo; Itaú notifica todos da chave)
      * @return array<string, mixed>
      * @throws GatewayException
      */
     public function registerWebhook(string $url, array $events): array
     {
-        $pixKey = $this->pixKey
-            ?? throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        if ($this->pixKey === null) {
+            throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        }
 
         $response = $this->request(
             'PUT',
-            self::PATH_PIX . '/webhook/' . urlencode($pixKey),
+            self::PATH_PIX . '/webhook/' . urlencode($this->pixKey),
             ['webhookUrl' => $url]
         );
 
         return [
             'webhookId' => $response['id']         ?? uniqid('WH_ITAU_'),
             'url'       => $response['webhookUrl'] ?? $url,
-            'chave'     => $pixKey,
+            'chave'     => $this->pixKey,
             'events'    => $events,
             'raw'       => $response,
         ];
@@ -672,25 +735,29 @@ class ItauGateway implements PaymentGatewayInterface
      */
     public function listWebhooks(): array
     {
-        $pixKey = $this->pixKey
-            ?? throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        if ($this->pixKey === null) {
+            throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        }
 
-        $response = $this->request('GET', self::PATH_PIX . '/webhook/' . urlencode($pixKey));
+        $response = $this->request('GET', self::PATH_PIX . '/webhook/' . urlencode($this->pixKey));
 
         return isset($response['webhookUrl']) ? [$response] : ($response['webhooks'] ?? []);
     }
 
     /**
-     * Remove o webhook da chave PIX configurada.
+     * Remove o webhook vinculado à chave PIX configurada.
+     * O parâmetro $webhookId é aceito por compatibilidade com a interface,
+     * mas o Itaú identifica o webhook pela chave PIX (não por ID).
      *
      * @throws GatewayException
      */
     public function deleteWebhook(string $webhookId): bool
     {
-        $pixKey = $this->pixKey
-            ?? throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        if ($this->pixKey === null) {
+            throw new GatewayException('Itaú Webhook: pixKey não configurada no construtor.');
+        }
 
-        $this->request('DELETE', self::PATH_PIX . '/webhook/' . urlencode($pixKey));
+        $this->request('DELETE', self::PATH_PIX . '/webhook/' . urlencode($this->pixKey));
 
         return true;
     }
@@ -702,18 +769,19 @@ class ItauGateway implements PaymentGatewayInterface
     /** @throws GatewayException */
     public function createCustomer(CustomerRequest $request): CustomerResponse
     {
-        $doc = preg_replace('/\D/', '', $request->taxId ?? $request->document ?? '');
+        // FIX: acessa taxId ou document com fallback seguro
+        $doc = preg_replace('/\D/', '', (string) ($request->taxId ?? $request->documentNumber ?? ''));
 
         $response = $this->request('POST', self::PATH_CONTA . '/clientes', [
             'nome'      => $request->name,
             'documento' => $doc,
-            'email'     => $request->email  ?? null,
-            'telefone'  => preg_replace('/\D/', '', $request->phone ?? ''),
+            'email'     => $request->email   ?? null,
+            'telefone'  => preg_replace('/\D/', '', (string) ($request->phone ?? '')),
         ]);
 
         return new CustomerResponse(
             success:     true,
-            customerId:  $response['id'] ?? uniqid('ITAU_CUST_'),
+            customerId:  (string) ($response['id'] ?? uniqid('ITAU_CUST_')),
             name:        $request->name,
             email:       $request->email ?? '',
             document:    $doc,
@@ -730,9 +798,9 @@ class ItauGateway implements PaymentGatewayInterface
         return new CustomerResponse(
             success:     true,
             customerId:  $customerId,
-            name:        $response['nome']      ?? $data['nome']      ?? '',
-            email:       $response['email']     ?? $data['email']     ?? '',
-            document:    $response['documento'] ?? $data['documento'] ?? '',
+            name:        (string) ($response['nome']      ?? $data['nome']      ?? ''),
+            email:       (string) ($response['email']     ?? $data['email']     ?? ''),
+            document:    (string) ($response['documento'] ?? $data['documento'] ?? ''),
             status:      'active',
             rawResponse: $response,
         );
@@ -746,10 +814,10 @@ class ItauGateway implements PaymentGatewayInterface
         return new CustomerResponse(
             success:     true,
             customerId:  $customerId,
-            name:        $response['nome']      ?? '',
-            email:       $response['email']     ?? '',
-            document:    $response['documento'] ?? '',
-            status:      $response['status']    ?? 'active',
+            name:        (string) ($response['nome']      ?? ''),
+            email:       (string) ($response['email']     ?? ''),
+            document:    (string) ($response['documento'] ?? ''),
+            status:      (string) ($response['status']    ?? 'active'),
             rawResponse: $response,
         );
     }
@@ -769,181 +837,219 @@ class ItauGateway implements PaymentGatewayInterface
     //  MÉTODOS NÃO SUPORTADOS
     // ══════════════════════════════════════════════════════════
 
+    /** @throws GatewayException */
     public function createCreditCardPayment(CreditCardPaymentRequest $request): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta cartão de crédito via API bancária. Use Adyen, Stripe ou PagarMe.');
     }
 
+    /** @throws GatewayException */
     public function tokenizeCard(array $cardData): string
     {
         throw new GatewayException('Itaú não suporta tokenização de cartão. Use Adyen, Stripe ou PagarMe.');
     }
 
+    /** @throws GatewayException */
     public function capturePreAuthorization(string $transactionId, ?float $amount = null): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta pré-autorização de cartão.');
     }
 
+    /** @throws GatewayException */
     public function cancelPreAuthorization(string $transactionId): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta cancelamento de pré-autorização.');
     }
 
+    /** @throws GatewayException */
     public function createDebitCardPayment(DebitCardPaymentRequest $request): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta cartão de débito. Use PagarMe ou C6Bank.');
     }
 
+    /** @throws GatewayException */
     public function createSubscription(SubscriptionRequest $request): SubscriptionResponse
     {
         throw new GatewayException('Itaú não suporta assinaturas recorrentes. Use Asaas, PagarMe ou C6Bank.');
     }
 
+    /** @throws GatewayException */
     public function cancelSubscription(string $subscriptionId): SubscriptionResponse
     {
         throw new GatewayException('Itaú não suporta gestão de assinaturas.');
     }
 
+    /** @throws GatewayException */
     public function suspendSubscription(string $subscriptionId): SubscriptionResponse
     {
         throw new GatewayException('Itaú não suporta gestão de assinaturas.');
     }
 
+    /** @throws GatewayException */
     public function reactivateSubscription(string $subscriptionId): SubscriptionResponse
     {
         throw new GatewayException('Itaú não suporta gestão de assinaturas.');
     }
 
+    /** @throws GatewayException */
     public function updateSubscription(string $subscriptionId, array $data): SubscriptionResponse
     {
         throw new GatewayException('Itaú não suporta gestão de assinaturas.');
     }
 
+    /** @throws GatewayException */
     public function getChargebacks(array $filters = []): array
     {
         throw new GatewayException('Itaú não suporta gestão de chargebacks via API bancária.');
     }
 
+    /** @throws GatewayException */
     public function disputeChargeback(string $chargebackId, array $evidence): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta disputa de chargebacks.');
     }
 
+    /** @throws GatewayException */
     public function createSplitPayment(SplitPaymentRequest $request): PaymentResponse
     {
         throw new GatewayException('Itaú não suporta split de pagamentos. Use Asaas ou PagarMe para marketplaces.');
     }
 
+    /** @throws GatewayException */
     public function createSubAccount(SubAccountRequest $request): SubAccountResponse
     {
         throw new GatewayException('Itaú não suporta sub-contas via API pública. Use C6Bank ou Asaas.');
     }
 
+    /** @throws GatewayException */
     public function updateSubAccount(string $subAccountId, array $data): SubAccountResponse
     {
         throw new GatewayException('Itaú não suporta gestão de sub-contas.');
     }
 
+    /** @throws GatewayException */
     public function getSubAccount(string $subAccountId): SubAccountResponse
     {
         throw new GatewayException('Itaú não suporta gestão de sub-contas.');
     }
 
+    /** @throws GatewayException */
     public function activateSubAccount(string $subAccountId): SubAccountResponse
     {
         throw new GatewayException('Itaú não suporta gestão de sub-contas.');
     }
 
+    /** @throws GatewayException */
     public function deactivateSubAccount(string $subAccountId): SubAccountResponse
     {
         throw new GatewayException('Itaú não suporta gestão de sub-contas.');
     }
 
+    /** @throws GatewayException */
     public function createWallet(WalletRequest $request): WalletResponse
     {
         throw new GatewayException('Itaú não suporta wallets digitais. Use C6Bank.');
     }
 
+    /** @throws GatewayException */
     public function addBalance(string $walletId, float $amount): WalletResponse
     {
         throw new GatewayException('Itaú não suporta wallets.');
     }
 
+    /** @throws GatewayException */
     public function deductBalance(string $walletId, float $amount): WalletResponse
     {
         throw new GatewayException('Itaú não suporta wallets.');
     }
 
+    /** @throws GatewayException */
     public function getWalletBalance(string $walletId): BalanceResponse
     {
         throw new GatewayException('Itaú não suporta wallets. Use getBalance() para saldo da conta corrente.');
     }
 
+    /** @throws GatewayException */
     public function transferBetweenWallets(string $fromWalletId, string $toWalletId, float $amount): TransferResponse
     {
         throw new GatewayException('Itaú não suporta transferências entre wallets.');
     }
 
+    /** @throws GatewayException */
     public function holdInEscrow(EscrowRequest $request): EscrowResponse
     {
         throw new GatewayException('Itaú não suporta escrow. Use C6Bank para custódia de valores.');
     }
 
+    /** @throws GatewayException */
     public function releaseEscrow(string $escrowId): EscrowResponse
     {
         throw new GatewayException('Itaú não suporta escrow.');
     }
 
+    /** @throws GatewayException */
     public function partialReleaseEscrow(string $escrowId, float $amount): EscrowResponse
     {
         throw new GatewayException('Itaú não suporta escrow.');
     }
 
+    /** @throws GatewayException */
     public function cancelEscrow(string $escrowId): EscrowResponse
     {
         throw new GatewayException('Itaú não suporta escrow.');
     }
 
+    /** @throws GatewayException */
     public function createPaymentLink(PaymentLinkRequest $request): PaymentLinkResponse
     {
         throw new GatewayException('Itaú não suporta links de pagamento via API. Use Asaas, PagarMe ou C6Bank.');
     }
 
+    /** @throws GatewayException */
     public function getPaymentLink(string $linkId): PaymentLinkResponse
     {
         throw new GatewayException('Itaú não suporta links de pagamento.');
     }
 
+    /** @throws GatewayException */
     public function expirePaymentLink(string $linkId): PaymentLinkResponse
     {
         throw new GatewayException('Itaú não suporta links de pagamento.');
     }
 
+    /** @throws GatewayException */
     public function analyzeTransaction(string $transactionId): array
     {
         throw new GatewayException('Itaú não expõe análise antifraude via API pública.');
     }
 
+    /** @throws GatewayException */
     public function addToBlacklist(string $identifier, string $type): bool
     {
         throw new GatewayException('Itaú não suporta blacklist via API.');
     }
 
+    /** @throws GatewayException */
     public function removeFromBlacklist(string $identifier, string $type): bool
     {
         throw new GatewayException('Itaú não suporta blacklist via API.');
     }
 
+    /** @throws GatewayException */
     public function anticipateReceivables(array $transactionIds): PaymentResponse
     {
         throw new GatewayException('Antecipação de recebíveis não disponível via API pública do Itaú. Contate seu gerente.');
     }
 
     // ══════════════════════════════════════════════════════════
-    //  HELPERS PRIVADOS
+    //  HELPERS PRIVADOS — TRANSFERÊNCIAS
     // ══════════════════════════════════════════════════════════
 
-    /** @throws GatewayException */
+    /**
+     * Executa transferência via PIX usando chave ou dados bancários.
+     *
+     * @throws GatewayException
+     */
     private function transferViaPix(TransferRequest $request): TransferResponse
     {
         $payload = [
@@ -956,27 +1062,32 @@ class ItauGateway implements PaymentGatewayInterface
         } else {
             $payload['favorecido'] = [
                 'nome'       => $request->recipientName,
-                'cpf_cnpj'   => preg_replace('/\D/', '', $request->metadata['recipientDocument'] ?? ''),
-                'banco'      => $request->metadata['bankCode']    ?? '',
-                'agencia'    => $request->metadata['agency']       ?? '',
-                'conta'      => $request->metadata['account']      ?? '',
-                'tipo_conta' => $request->metadata['accountType']  ?? 'corrente',
+                'cpf_cnpj'   => preg_replace('/\D/', '', (string) ($request->metadata['recipientDocument'] ?? '')),
+                'banco'      => $request->metadata['bankCode']   ?? '',
+                'agencia'    => $request->metadata['agency']     ?? '',
+                'conta'      => $request->metadata['account']    ?? '',
+                'tipo_conta' => $request->metadata['accountType'] ?? 'corrente',
             ];
         }
 
         $response = $this->request('POST', self::PATH_PIX . '/pix', $payload);
 
-        return new TransferResponse(
+        return TransferResponse::create(
             success:     true,
-            transferId:  $response['endToEndId'] ?? uniqid('PIX_ITAU_'),
-            status:      PaymentStatus::PENDING,
-            money:       Money::from($request->amount, Currency::BRL),
+            transferId:  (string) ($response['endToEndId'] ?? uniqid('PIX_ITAU_')),
+            amount:      $request->amount,
+            status:      PaymentStatus::PENDING->value,
+            currency:    'BRL',
             message:     'Transferência PIX iniciada.',
             rawResponse: $response,
         );
     }
 
-    /** @throws GatewayException */
+    /**
+     * Executa transferência via TED.
+     *
+     * @throws GatewayException
+     */
     private function transferViaTed(TransferRequest $request): TransferResponse
     {
         $payload = [
@@ -984,21 +1095,22 @@ class ItauGateway implements PaymentGatewayInterface
             'descricao'  => $request->description ?? 'Transferência TED',
             'favorecido' => [
                 'nome'       => $request->recipientName,
-                'cpf_cnpj'   => preg_replace('/\D/', '', $request->metadata['recipientDocument'] ?? ''),
+                'cpf_cnpj'   => preg_replace('/\D/', '', (string) ($request->metadata['recipientDocument'] ?? '')),
                 'banco'      => $request->metadata['bankCode']   ?? '',
-                'agencia'    => $request->metadata['agency']      ?? '',
-                'conta'      => $request->metadata['account']     ?? '',
+                'agencia'    => $request->metadata['agency']     ?? '',
+                'conta'      => $request->metadata['account']    ?? '',
                 'tipo_conta' => $request->metadata['accountType'] ?? 'corrente',
             ],
         ];
 
         $response = $this->request('POST', self::PATH_CONTA . '/transferencias/ted', $payload);
 
-        return new TransferResponse(
+        return TransferResponse::create(
             success:     true,
-            transferId:  $response['id'] ?? uniqid('TED_ITAU_'),
-            status:      PaymentStatus::PENDING,
-            money:       Money::from($request->amount, Currency::BRL),
+            transferId:  (string) ($response['id'] ?? uniqid('TED_ITAU_')),
+            amount:      $request->amount,
+            status:      PaymentStatus::PENDING->value,
+            currency:    'BRL',
             message:     'Transferência TED iniciada.',
             rawResponse: $response,
         );
@@ -1052,10 +1164,13 @@ class ItauGateway implements PaymentGatewayInterface
         $body     = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr  = curl_errno($ch);
+        $curlErrMsg = curl_error($ch);
         curl_close($ch);
 
         if ($curlErr !== 0) {
-            throw new GatewayException('Itaú OAuth: cURL error — ' . curl_strerror($curlErr));
+            throw new GatewayException(
+                'Itaú OAuth: cURL error (' . $curlErr . ') — ' . $curlErrMsg
+            );
         }
 
         $data = json_decode((string) $body, true);
@@ -1074,7 +1189,11 @@ class ItauGateway implements PaymentGatewayInterface
         $this->tokenExpiresAt = time() + (int) ($data['expires_in'] ?? 3600) - 60;
     }
 
-    /** @throws GatewayException */
+    /**
+     * Retorna o access token vigente, renovando se necessário.
+     *
+     * @throws GatewayException
+     */
     private function getToken(): string
     {
         if ($this->accessToken === null || time() >= ($this->tokenExpiresAt ?? 0)) {
@@ -1100,8 +1219,8 @@ class ItauGateway implements PaymentGatewayInterface
      *
      * @param string               $method  GET | POST | PUT | PATCH | DELETE
      * @param string               $path    Caminho após baseUrl
-     * @param array<string, mixed> $body    Dados JSON
-     * @param array<string, mixed> $query   Parâmetros query string
+     * @param array<string, mixed> $body    Dados JSON do corpo da requisição
+     * @param array<string, mixed> $query   Parâmetros de query string
      * @return array<string, mixed>
      * @throws GatewayException
      */
@@ -1123,7 +1242,9 @@ class ItauGateway implements PaymentGatewayInterface
         if ($body !== []) {
             $encoded = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             if ($encoded === false) {
-                throw new GatewayException('Itaú API: falha ao serializar payload — ' . json_last_error_msg());
+                throw new GatewayException(
+                    'Itaú API: falha ao serializar payload — ' . json_last_error_msg()
+                );
             }
             $jsonBody = $encoded;
         }
@@ -1177,7 +1298,9 @@ class ItauGateway implements PaymentGatewayInterface
             curl_close($ch);
 
             if ($curlErr !== 0) {
-                throw new GatewayException('Itaú API: cURL error (' . $curlErr . ') — ' . $curlErrMsg);
+                throw new GatewayException(
+                    'Itaú API: cURL error (' . $curlErr . ') — ' . $curlErrMsg
+                );
             }
 
             // Retry com backoff exponencial para erros transitórios
@@ -1188,8 +1311,9 @@ class ItauGateway implements PaymentGatewayInterface
 
             $data = json_decode((string) $responseBody, true) ?? [];
 
+            // HTTP 204 No Content — operação bem-sucedida sem corpo (ex: DELETE)
             if ($httpCode === 204) {
-                return []; // DELETE com sucesso
+                return [];
             }
 
             if ($httpCode < 200 || $httpCode >= 300) {

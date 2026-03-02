@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * ╔══════════════════════════════════════════════════════════╗
  * ║         ITAÚ GATEWAY — EXEMPLOS COMPLETOS               ║
@@ -16,12 +18,18 @@ require_once __DIR__ . '/../../../vendor/autoload.php';
 
 use IsraelNogueira\PaymentHub\Gateways\Itau\ItauGateway;
 use IsraelNogueira\PaymentHub\PaymentHub;
-use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\BoletoPaymentRequest;
-use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
-use IsraelNogueira\PaymentHub\DataObjects\Requests\TransferRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\CreditCardPaymentRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\CustomerRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\EscrowRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\SplitPaymentRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\SubscriptionRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\TransferRequest;
+use IsraelNogueira\PaymentHub\Enums\Currency;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
+use DateTime;
 
 // ══════════════════════════════════════════════════════════════
 //  CONFIGURAÇÃO
@@ -50,16 +58,18 @@ echo str_repeat('═', 70) . "\n\n";
 
 echo "=== 1. COBRANÇA PIX ===\n\n";
 
+$txid = null;
+
 try {
     $pixRequest = new PixPaymentRequest(
         amount:           150.75,
         currency:         'BRL',
         customerName:     'Maria Silva Santos',
-        customerDocument: '123.456.789-09',
+        customerDocument: '12345678909',
         customerEmail:    'maria@example.com',
         description:      'Pedido #12345 — Loja Online',
         metadata: [
-            'expiracao'     => 3600,   // expira em 1 hora
+            'expiracao'      => 3600,
             'infoAdicionais' => [
                 ['nome' => 'Pedido', 'valor' => '12345'],
                 ['nome' => 'Loja',   'valor' => 'Minha Loja'],
@@ -68,16 +78,16 @@ try {
     );
 
     $pix = $hub->createPixPayment($pixRequest);
+    $txid = $pix->transactionId;
 
     echo "✅ PIX criado!\n";
     echo "   txid:     " . $pix->transactionId . "\n";
     echo "   Status:   " . $pix->status->value . "\n";
-    echo "   Valor:    R$ " . number_format($pix->money->amount, 2, ',', '.') . "\n";
+    echo "   Valor:    R$ " . number_format($pix->money->amount(), 2, ',', '.') . "\n";
     echo "   Mensagem: " . $pix->message . "\n";
     echo "   Location: " . ($pix->metadata['location'] ?? 'N/A') . "\n\n";
 
     // QR Code e Copia & Cola
-    $txid      = $pix->transactionId;
     $qrCode    = $hub->getPixQrCode($txid);
     $copyPaste = $hub->getPixCopyPaste($txid);
 
@@ -103,7 +113,7 @@ try {
     echo "✅ Status consultado!\n";
     echo "   txid:   " . $status->transactionId . "\n";
     echo "   Status: " . $status->status->value . "\n";
-    echo "   Valor:  R$ " . number_format($status->amount, 2, ',', '.') . "\n\n";
+    echo "   Valor:  R$ " . number_format($status->money->amount(), 2, ',', '.') . "\n\n";
 
 } catch (GatewayException $e) {
     echo "❌ Erro Status: " . $e->getMessage() . "\n\n";
@@ -118,7 +128,7 @@ echo "=== 3. ESTORNO PIX ===\n\n";
 try {
     // Estorno total
     $estornoRequest = new RefundRequest(
-        transactionId: 'E00341934302501151234567890123', // E2EId do PIX recebido
+        transactionId: 'E00341934302501151234567890123',
         amount:        150.75,
         reason:        'Produto fora de estoque — pedido cancelado',
         metadata: [
@@ -130,8 +140,8 @@ try {
 
     echo "✅ Estorno solicitado!\n";
     echo "   ID:     " . $estorno->refundId . "\n";
-    echo "   Status: " . $estorno->status . "\n";
-    echo "   Valor:  R$ " . number_format($estorno->amount, 2, ',', '.') . "\n\n";
+    echo "   Status: " . $estorno->status->value . "\n";
+    echo "   Valor:  R$ " . number_format($estorno->money->amount(), 2, ',', '.') . "\n\n";
 
     // Estorno parcial
     $estornoParcial = $hub->partialRefund(
@@ -141,7 +151,7 @@ try {
 
     echo "✅ Estorno parcial solicitado!\n";
     echo "   ID:     " . $estornoParcial->refundId . "\n";
-    echo "   Valor:  R$ " . number_format($estornoParcial->amount, 2, ',', '.') . "\n\n";
+    echo "   Valor:  R$ " . number_format($estornoParcial->money->amount(), 2, ',', '.') . "\n\n";
 
 } catch (GatewayException $e) {
     echo "❌ Erro Estorno: " . $e->getMessage() . "\n\n";
@@ -153,34 +163,37 @@ try {
 
 echo "=== 4. BOLETO BANCÁRIO ===\n\n";
 
+$boleto = null;
+
 try {
     $boletoRequest = new BoletoPaymentRequest(
         amount:           350.00,
         currency:         'BRL',
         customerName:     'João Pedro Oliveira',
-        customerDocument: '987.654.321-00',
+        customerDocument: '98765432100',
         customerEmail:    'joao@example.com',
         dueDate:          new DateTime('+5 days'),
         description:      'Fatura de serviços — Ref. Jan/2025',
         metadata: [
-            'carteira'   => '109',
-            'especie'    => 'DUPLICATA_MERCANTIL',
-            'endereco'   => 'Av. Paulista, 1000',
-            'bairro'     => 'Bela Vista',
-            'cidade'     => 'São Paulo',
-            'uf'         => 'SP',
-            'cep'        => '01310-100',
-            'seuNumero'  => 'NF-2025-001',
+            'carteira'  => '109',
+            'especie'   => 'DUPLICATA_MERCANTIL',
+            'endereco'  => 'Av. Paulista, 1000',
+            'bairro'    => 'Bela Vista',
+            'cidade'    => 'São Paulo',
+            'uf'        => 'SP',
+            'cep'       => '01310100',
+            'seuNumero' => 'NF-2025-001',
         ],
     );
 
     $boleto = $hub->createBoleto($boletoRequest);
 
     echo "✅ Boleto registrado!\n";
-    echo "   Nosso Número:    " . $boleto->transactionId . "\n";
-    echo "   Status:          " . $boleto->status->value . "\n";
-    echo "   Linha Digitável: " . ($boleto->metadata['linhaDigitavel'] ?? 'N/A') . "\n";
-    echo "   Código de Barras:" . ($boleto->metadata['codigoBarras']   ?? 'N/A') . "\n\n";
+    echo "   Nosso Número:     " . $boleto->transactionId . "\n";
+    echo "   Status:           " . $boleto->status->value . "\n";
+    echo "   Valor:            R$ " . number_format($boleto->money->amount(), 2, ',', '.') . "\n";
+    echo "   Linha Digitável:  " . ($boleto->metadata['linhaDigitavel'] ?? 'N/A') . "\n";
+    echo "   Código de Barras: " . ($boleto->metadata['codigoBarras']   ?? 'N/A') . "\n\n";
 
     // URL do boleto para impressão
     $url = $hub->getBoletoUrl($boleto->transactionId);
@@ -198,7 +211,7 @@ try {
 echo "=== 5. CANCELAR BOLETO ===\n\n";
 
 try {
-    $cancelamento = $hub->cancelBoleto($boleto->transactionId ?? '12345678901');
+    $cancelamento = $hub->cancelBoleto($boleto?->transactionId ?? '12345678901');
 
     echo "✅ Boleto cancelado!\n";
     echo "   Status: " . $cancelamento->status->value . "\n\n";
@@ -220,14 +233,14 @@ try {
         recipientName: 'Carlos Eduardo Mendes',
         description:   'Pagamento de fornecedor — Ref. 2025/001',
         metadata: [
-            'pixKey' => 'carlos@email.com', // Chave PIX do destinatário
+            'pixKey' => 'carlos@email.com',
         ],
     ));
 
     echo "✅ PIX enviado!\n";
     echo "   EndToEndId: " . $pixTransfer->transferId . "\n";
     echo "   Status:     " . $pixTransfer->status->value . "\n";
-    echo "   Valor:      R$ " . number_format($pixTransfer->money->amount, 2, ',', '.') . "\n\n";
+    echo "   Valor:      R$ " . number_format($pixTransfer->money->amount(), 2, ',', '.') . "\n\n";
 
     // Por dados bancários (sem chave PIX)
     $pixTransferConta = $hub->transfer(new TransferRequest(
@@ -235,8 +248,8 @@ try {
         recipientName: 'Ana Paula Costa',
         description:   'Reembolso de despesas',
         metadata: [
-            'recipientDocument' => '111.222.333-44',
-            'bankCode'          => '341',       // Código Itaú
+            'recipientDocument' => '11122233344',
+            'bankCode'          => '341',
             'agency'            => '1234',
             'account'           => '56789-0',
             'accountType'       => 'corrente',
@@ -263,9 +276,9 @@ try {
         recipientName: 'Empresa XYZ Ltda',
         description:   'Pagamento de serviços — NF 2025-0042',
         metadata: [
-            'method'            => 'ted',          // ← força TED
-            'recipientDocument' => '12.345.678/0001-99',
-            'bankCode'          => '237',           // Bradesco
+            'method'            => 'ted',
+            'recipientDocument' => '12345678000199',
+            'bankCode'          => '237',
             'agency'            => '0001',
             'account'           => '123456-7',
             'accountType'       => 'corrente',
@@ -275,7 +288,7 @@ try {
     echo "✅ TED enviada!\n";
     echo "   ID:     " . $ted->transferId . "\n";
     echo "   Status: " . $ted->status->value . "\n";
-    echo "   Valor:  R$ " . number_format($ted->money->amount, 2, ',', '.') . "\n\n";
+    echo "   Valor:  R$ " . number_format($ted->money->amount(), 2, ',', '.') . "\n\n";
 
 } catch (GatewayException $e) {
     echo "❌ Erro TED: " . $e->getMessage() . "\n\n";
@@ -294,14 +307,14 @@ try {
             recipientName: 'Luciana Ferreira',
             description:   'Salário — competência Fevereiro/2025',
             metadata: [
-                'recipientDocument' => '555.666.777-88',
+                'recipientDocument' => '55566677788',
                 'bankCode'          => '341',
                 'agency'            => '4567',
                 'account'           => '99876-5',
                 'accountType'       => 'corrente',
             ],
         ),
-        date: '2025-02-05'   // Data do agendamento (YYYY-MM-DD)
+        date: '2025-02-05'
     );
 
     echo "✅ Transferência agendada!\n";
@@ -328,7 +341,7 @@ try {
     $saldo = $hub->getBalance();
 
     echo "✅ Saldo consultado!\n";
-    echo "   Saldo disponível: R$ " . number_format($saldo->balance, 2, ',', '.') . "\n";
+    echo "   Saldo disponível: R$ " . number_format($saldo->availableBalance, 2, ',', '.') . "\n";
     echo "   Saldo bloqueado:  R$ " . number_format($saldo->pendingBalance, 2, ',', '.') . "\n\n";
 
 } catch (GatewayException $e) {
@@ -373,7 +386,7 @@ try {
     $cobranças = $hub->listTransactions([
         'inicio' => '2025-01-01T00:00:00Z',
         'fim'    => '2025-01-31T23:59:59Z',
-        'cpf'    => '123.456.789-09',
+        'cpf'    => '12345678909',
     ]);
 
     echo "✅ Cobranças encontradas: " . count($cobranças) . "\n";
@@ -395,10 +408,9 @@ try {
 echo "=== 12. WEBHOOKS ===\n\n";
 
 try {
-    // Registrar webhook
     $webhook = $hub->registerWebhook(
         url:    'https://seusite.com/webhooks/itau',
-        events: ['pix.recebido', 'pix.devolucao', 'boleto.liquidado']
+        events: ['pix.recebido', 'pix.devolucao']
     );
 
     echo "✅ Webhook registrado!\n";
@@ -406,11 +418,9 @@ try {
     echo "   URL:   " . $webhook['url'] . "\n";
     echo "   Chave: " . $webhook['chave'] . "\n\n";
 
-    // Listar webhooks
     $webhooks = $hub->listWebhooks();
     echo "✅ Webhooks ativos: " . count($webhooks) . "\n\n";
 
-    // Deletar webhook
     $hub->deleteWebhook($webhook['webhookId']);
     echo "✅ Webhook removido!\n\n";
 
@@ -425,23 +435,21 @@ try {
 echo "=== 13. CLIENTES ===\n\n";
 
 try {
-    // Criar cliente
     $customerRequest = new CustomerRequest(
-        name:     'Fernanda Lima Souza',
-        taxId:    '444.555.666-77',
-        email:    'fernanda@example.com',
-        phone:    '(11) 98765-4321',
+        name:  'Fernanda Lima Souza',
+        taxId: '44455566677',
+        email: 'fernanda@example.com',
+        phone: '11987654321',
     );
 
     $customer = $hub->createCustomer($customerRequest);
 
     echo "✅ Cliente criado!\n";
-    echo "   ID:       " . $customer->customerId . "\n";
-    echo "   Nome:     " . $customer->name . "\n";
-    echo "   Email:    " . $customer->email . "\n";
-    echo "   Status:   " . $customer->status . "\n\n";
+    echo "   ID:     " . $customer->customerId . "\n";
+    echo "   Nome:   " . $customer->name . "\n";
+    echo "   Email:  " . $customer->email . "\n";
+    echo "   Status: " . $customer->status . "\n\n";
 
-    // Atualizar cliente
     $updated = $hub->updateCustomer($customer->customerId, [
         'email'    => 'fernanda.novo@example.com',
         'telefone' => '11987654321',
@@ -449,11 +457,9 @@ try {
     echo "✅ Cliente atualizado!\n";
     echo "   Novo e-mail: " . $updated->email . "\n\n";
 
-    // Buscar cliente
     $found = $hub->getCustomer($customer->customerId);
     echo "✅ Cliente encontrado: " . $found->name . "\n\n";
 
-    // Listar clientes
     $lista = $hub->listCustomers(['pagina' => 1]);
     echo "✅ Clientes na conta: " . count($lista) . "\n\n";
 
@@ -468,26 +474,35 @@ try {
 echo "=== 14. MÉTODOS NÃO SUPORTADOS ===\n\n";
 
 $unsupported = [
-    'Cartão de Crédito' => fn() => $hub->createCreditCardPayment(
-        \IsraelNogueira\PaymentHub\DataObjects\Requests\CreditCardPaymentRequest::create(
-            amount: 100.00, cardNumber: '4111111111111111',
-            cardHolderName: 'Test', cardExpiryMonth: '12',
-            cardExpiryYear: '2026', cardCvv: '123',
+    'Cartão de Crédito' => static fn () => $hub->createCreditCardPayment(
+        CreditCardPaymentRequest::create(
+            amount:          100.00,
+            cardNumber:      '4111111111111111',
+            cardHolderName:  'Test',
+            cardExpiryMonth: '12',
+            cardExpiryYear:  '2026',
+            cardCvv:         '123',
         )
     ),
-    'Assinatura'   => fn() => $hub->createSubscription(
-        \IsraelNogueira\PaymentHub\DataObjects\Requests\SubscriptionRequest::create(
-            amount: 29.90, interval: 'monthly', customerEmail: 'test@test.com', cardToken: 'tok_123'
+    'Assinatura' => static fn () => $hub->createSubscription(
+        SubscriptionRequest::create(
+            amount:        29.90,
+            interval:      'monthly',
+            customerEmail: 'test@test.com',
+            cardToken:     'tok_123',
         )
     ),
-    'Split'        => fn() => $hub->createSplitPayment(
-        \IsraelNogueira\PaymentHub\DataObjects\Requests\SplitPaymentRequest::create(
-            amount: 100.00, splits: [], paymentMethod: 'pix'
+    'Split' => static fn () => $hub->createSplitPayment(
+        SplitPaymentRequest::create(
+            amount:        100.00,
+            splits:        [],
+            paymentMethod: 'pix',
         )
     ),
-    'Escrow'       => fn() => $hub->holdInEscrow(
-        \IsraelNogueira\PaymentHub\DataObjects\Requests\EscrowRequest::create(
-            amount: 100.00, currency: \IsraelNogueira\PaymentHub\Enums\Currency::BRL
+    'Escrow' => static fn () => $hub->holdInEscrow(
+        EscrowRequest::create(
+            amount:   100.00,
+            currency: Currency::BRL,
         )
     ),
 ];
