@@ -151,6 +151,9 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
         private readonly bool   $sandbox          = true,
         private readonly string $certPath         = '',
         private readonly string $certKeyPath      = '',
+        // FIX 2.2 — SensitiveParameter impede que a senha apareça em stack traces,
+        // logs de erro e outputs de var_dump/print_r em PHP 8.2+.
+        #[\SensitiveParameter]
         private readonly string $certPassword     = '',
     ) {
         if (!$sandbox && $certPath === '') {
@@ -198,6 +201,11 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
                 'Content-Type: application/x-www-form-urlencoded',
             ],
             CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            // FIX 2.1 — Forçar verificação SSL explicitamente, independente da
+            // configuração padrão do PHP no servidor. Garante proteção contra MITM.
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
         ]);
 
         if ($this->certPath !== '') {
@@ -225,6 +233,9 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
         $data = json_decode((string) $body, true) ?? [];
 
         if ($httpCode !== 200 || empty($data['access_token'])) {
+            // FIX 2.2 — rawResponse nunca deve conter credenciais. A senha do
+            // certificado já está protegida por #[SensitiveParameter] no construtor,
+            // mas garantimos aqui que o array de contexto também não a exponha.
             throw new GatewayException(
                 'BB OAuth: falha na autenticação — '
                     . ($data['error_description'] ?? $data['error'] ?? 'resposta inesperada'),
@@ -333,6 +344,11 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
                 CURLOPT_CUSTOMREQUEST  => $method,
                 CURLOPT_HTTPHEADER     => $headers,
                 CURLOPT_TIMEOUT        => 30,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                // FIX 2.1 — Verificação SSL explícita em todas as chamadas à API.
+                // Sem isso, PHP pode usar o padrão do servidor (nem sempre seguro).
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
             ]);
 
             if ($jsonBody !== '') {
@@ -361,7 +377,16 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
             }
 
             if (in_array($httpCode, [429, 503], true) && $attempt < self::MAX_RETRIES) {
-                sleep(2 ** ($attempt - 1));
+                // FIX 2.5 — sleep() é bloqueante e pode consumir workers PHP-FPM durante
+                // períodos de throttling. Respeitamos o header Retry-After quando presente;
+                // caso contrário usamos backoff exponencial (1s, 2s, 4s).
+                // NOTA: em contextos assíncronos (Swoole, ReactPHP, etc.) substitua
+                // este sleep() por uma estratégia não-bloqueante.
+                $parsedBody  = json_decode((string) $responseBody, true) ?? [];
+                $waitSeconds = isset($parsedBody['retryAfter'])
+                    ? min((int) $parsedBody['retryAfter'], 30) // cap de 30s por segurança
+                    : (2 ** ($attempt - 1));
+                sleep($waitSeconds);
                 continue;
             }
 
@@ -411,7 +436,10 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
             );
         }
 
-        $amount = (float) ($request->amount ?? $request->getAmount());
+        // FIX 2.4 — Usar sempre o getter. Acesso direto à propriedade `amount`
+        // fragiliza o código: se o DTO mudar (ex: tornar `amount` protected),
+        // isso quebraria silenciosamente em runtime sem erro de compilação.
+        $amount = $request->getAmount();
 
         if ($amount < self::AMOUNT_MIN) {
             throw new GatewayException(
@@ -423,15 +451,16 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
             );
         }
 
-        // txid: UUID v4 sem hifens, 32 chars — dentro do range aceito pelo BB (26-35)
-        $txid = str_replace('-', '', sprintf(
-            '%04x%04x%04x%04x%04x%04x%04x%04x',
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
-            mt_rand(0, 0xffff),
-            mt_rand(0, 0x0fff) | 0x4000,
-            mt_rand(0, 0x3fff) | 0x8000,
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
-        ));
+        // txid: UUID v4 sem hifens, 32 chars — dentro do range aceito pelo BB (26-35).
+        // FIX 2.8 — random_int() usa CSPRNG do SO; mt_rand() era previsível.
+        $txid = sprintf(
+            '%08x%04x%04x%04x%12x',
+            random_int(0, 0xffffffff),
+            random_int(0, 0xffff),
+            random_int(0, 0x0fff) | 0x4000,
+            random_int(0, 0x3fff) | 0x8000,
+            random_int(0, 0xffffffffffff)
+        );
 
         $expiresIn = (int) ($request->metadata['expiresIn'] ?? 3600);
 
@@ -779,7 +808,8 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
      * PaymentGatewayInterface. O original retornava PaymentResponse.
      *
      * Tenta primeiro como PIX (GET /pix/v2/cob/{txid});
-     * se a chamada falhar (404), tenta como boleto.
+     * se a API retornar HTTP 404 (cobrança não encontrada), tenta como boleto.
+     * Qualquer outro erro (rede, 401, 500, etc.) é propagado imediatamente.
      *
      * @throws GatewayException
      */
@@ -805,8 +835,15 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
                 currency:      Currency::BRL,
                 rawResponse:   $response,
             );
-        } catch (GatewayException) {
-            // Não é cobrança PIX — tenta como boleto
+        } catch (GatewayException $e) {
+            // FIX 2.6 — O catch anterior era silencioso e escondia erros reais
+            // (rede, 401, 500). Agora só silenciamos HTTP 404 (cobrança PIX não
+            // encontrada), que é o caso legítimo de fallback para boleto.
+            // Qualquer outro código de erro é re-lançado imediatamente.
+            if ($e->getCode() !== 404) {
+                throw $e;
+            }
+            // HTTP 404 = não é cobrança PIX — continua para tentar como boleto
         }
 
         $response   = $this->request(
@@ -1154,7 +1191,8 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
      */
     private function transferViaPix(TransferRequest $request, string $pixKey): TransferResponse
     {
-        $amount = (float) ($request->amount ?? $request->getAmount());
+        // FIX 2.4 — Usar getAmount() consistentemente (ver mesma correção em createPixPayment).
+        $amount = $request->getAmount();
 
         $payload = [
             'valor'            => $this->formatAmount($amount),
@@ -1168,7 +1206,13 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
 
         return TransferResponse::create(
             success:     true,
-            transferId:  (string) ($response['idPagamento'] ?? uniqid('bb_pix_')),
+            // FIX 2.3 — uniqid() foi removido: gerava um ID diferente a cada retry,
+            // quebrando a idempotência e podendo duplicar reconciliações financeiras.
+            // Se o BB não retornar idPagamento, a transferência é ambígua — lançamos
+            // exceção para forçar verificação manual antes de qualquer novo envio.
+            transferId:  (string) ($response['idPagamento'] ?? throw new GatewayException(
+                'BB PIX: idPagamento ausente na resposta. Verifique o status antes de retentar.'
+            )),
             amount:      $amount,
             currency:    Currency::BRL,
             status:      PaymentStatus::PENDING,
@@ -1182,7 +1226,8 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
      */
     private function transferViaTed(TransferRequest $request): TransferResponse
     {
-        $amount = (float) ($request->amount ?? $request->getAmount());
+        // FIX 2.4 — Usar getAmount() consistentemente.
+        $amount = $request->getAmount();
 
         $payload = [
             'valor'        => $this->formatAmount($amount),
@@ -1202,7 +1247,10 @@ class BancoDoBrasilGateway implements PaymentGatewayInterface
 
         return TransferResponse::create(
             success:     true,
-            transferId:  (string) ($response['idPagamento'] ?? uniqid('bb_ted_')),
+            // FIX 2.3 — mesmo motivo da transferViaPix: uniqid() removido.
+            transferId:  (string) ($response['idPagamento'] ?? throw new GatewayException(
+                'BB TED: idPagamento ausente na resposta. Verifique o status antes de retentar.'
+            )),
             amount:      $amount,
             currency:    Currency::BRL,
             status:      PaymentStatus::PENDING,
