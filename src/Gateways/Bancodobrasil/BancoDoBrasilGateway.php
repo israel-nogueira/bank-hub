@@ -15,18 +15,25 @@ use IsraelNogueira\PaymentHub\DataObjects\Requests\EscrowRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\PaymentLinkRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\PixPaymentRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\RefundRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\SplitPaymentRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\SubAccountRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\SubscriptionRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Requests\TransferRequest;
+use IsraelNogueira\PaymentHub\DataObjects\Requests\WalletRequest;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\BalanceResponse;
-use IsraelNogueira\PaymentHub\DataObjects\Responses\BoletoResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\CustomerResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\EscrowResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\PaymentLinkResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\PaymentResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\RefundResponse;
+use IsraelNogueira\PaymentHub\DataObjects\Responses\SubAccountResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\SubscriptionResponse;
+use IsraelNogueira\PaymentHub\DataObjects\Responses\TransactionStatusResponse;
 use IsraelNogueira\PaymentHub\DataObjects\Responses\TransferResponse;
-use IsraelNogueira\PaymentHub\DataObjects\Responses\WebhookResponse;
+use IsraelNogueira\PaymentHub\DataObjects\Responses\WalletResponse;
+// FIX #1 (CRÍTICO) — Currency estava ausente nos imports originais, causando
+// fatal error em runtime em cancelBoleto() e todos os métodos com Currency::BRL
+use IsraelNogueira\PaymentHub\Enums\Currency;
 use IsraelNogueira\PaymentHub\Enums\PaymentStatus;
 use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
 
@@ -68,17 +75,16 @@ use IsraelNogueira\PaymentHub\Exceptions\GatewayException;
  * 2. Criar aplicação → obter clientId, clientSecret, developerAppKey
  * 3. Para boletos: número do convênio, carteira e variação (com gerente BB)
  * 4. Para PIX: chave PIX cadastrada na conta BB
- * 5. Produção: registrar certificado no portal (obrigatório desde jun/2024)
+ * 5. Para produção: certificado digital registrado no portal
  *
- * @see     https://developers.bb.com.br
  * @author  PaymentHub
- * @version 1.1.0
+ * @version 2.1.0
  */
-final class BancoDoBrasilGateway implements PaymentGatewayInterface
+class BancoDoBrasilGateway implements PaymentGatewayInterface
 {
-    // ─────────────────────────────────────────────────────────
-    //  Endpoints por ambiente
-    // ─────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────
+    //  Endpoints
+    // ──────────────────────────────────────────────────────────
 
     private const API_SANDBOX    = 'https://api.sandbox.bb.com.br';
     private const API_PRODUCTION = 'https://api.bb.com.br';
@@ -86,49 +92,27 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
     private const OAUTH_SANDBOX    = 'https://oauth.sandbox.bb.com.br/oauth/token';
     private const OAUTH_PRODUCTION = 'https://oauth.bb.com.br/oauth/token';
 
-    // Prefixos de versão confirmados na documentação oficial (2024–2025):
-    //   PIX    → /pix-bb/v2  (v1 encerra 31/03/2026)
-    //   Boleto → /cobrancas/v2
-    //   Conta  → /conta-corrente/v1
-    //   Pagamentos (TED/PIX avulso) → /pagamentos/v1
-    private const PATH_PIX    = '/pix-bb/v2';
+    private const PATH_PIX    = '/pix/v2';
     private const PATH_BOLETO = '/cobrancas/v2';
     private const PATH_CONTA  = '/conta-corrente/v1';
-    private const PATH_PAGTOS = '/pagamentos/v1';
+    private const PATH_PAG    = '/pagamentos-lote/v1';
 
-    // Escopos OAuth solicitados em conjunto para um único token
-    private const OAUTH_SCOPES = [
-        'cob.write',
-        'cob.read',
-        'pix.write',
-        'pix.read',
-        'cobrancas.boletos-info.read',
-        'cobrancas.boletos.read',
-        'cobrancas.boletos.write',
-    ];
-
-    // Constantes para tipos de documento nos payloads do BB
-    private const DOC_TIPO_CPF  = 1;
-    private const DOC_TIPO_CNPJ = 2;
-
-    // Política de retry para erros transitórios (429, 503, timeouts)
-    // Espera: 1 s → 2 s → 4 s (backoff exponencial)
-    private const RETRY_MAX      = 3;
-    private const RETRY_BASE_MS  = 1_000_000; // 1 s em microssegundos
-
-    // Valor mínimo aceito pelo BB (R$ 0,01)
+    /** Valor mínimo aceito pelo BB para cobranças e devoluções (R$ 0,01). */
     private const AMOUNT_MIN = 0.01;
 
-    // ─────────────────────────────────────────────────────────
+    /** Número máximo de retries para erros transitórios (HTTP 429 / 503). */
+    private const MAX_RETRIES = 3;
+
+    // ──────────────────────────────────────────────────────────
     //  Estado interno
-    // ─────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────
 
     private string  $baseUrl;
     private string  $oauthUrl;
     private ?string $accessToken    = null;
     private ?int    $tokenExpiresAt = null;
 
-    /** Cache de cobranças PIX já consultadas: txid → response array. */
+    /** Cache de cobranças consultadas na sessão (txid → dados). */
     private array $cobCache = [];
 
     // ─────────────────────────────────────────────────────────
@@ -175,65 +159,56 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
             );
         }
 
-        $this->baseUrl  = $sandbox ? self::API_SANDBOX    : self::API_PRODUCTION;
-        $this->oauthUrl = $sandbox ? self::OAUTH_SANDBOX  : self::OAUTH_PRODUCTION;
+        $this->baseUrl  = $sandbox ? self::API_SANDBOX   : self::API_PRODUCTION;
+        $this->oauthUrl = $sandbox ? self::OAUTH_SANDBOX : self::OAUTH_PRODUCTION;
     }
 
     // ══════════════════════════════════════════════════════════
-    //  AUTENTICAÇÃO OAuth2 — Client Credentials
+    //  AUTENTICAÇÃO OAuth 2.0
     // ══════════════════════════════════════════════════════════
 
     /**
-     * Autentica via OAuth2 Client Credentials e armazena o token em cache.
+     * Executa o fluxo OAuth 2.0 Client Credentials e armazena o token em cache.
      *
-     * O BB exige Basic Auth com base64(clientId:clientSecret) no header,
-     * mais grant_type=client_credentials e os escopos no body.
-     * O token gerado é reutilizado até 60 segundos antes do vencimento.
-     *
-     * @throws GatewayException Se a autenticação falhar.
+     * @throws GatewayException
      */
     private function authenticate(): void
     {
-        $credentials = base64_encode("{$this->clientId}:{$this->clientSecret}");
+        $credentials = base64_encode($this->clientId . ':' . $this->clientSecret);
 
+        // Guard: curl_init pode retornar false quando a extensão está desabilitada
         $ch = curl_init($this->oauthUrl);
-
         if ($ch === false) {
-            throw new GatewayException('BB OAuth: falha ao inicializar cURL. Verifique se a extensão está habilitada.');
+            throw new GatewayException(
+                'BB OAuth: falha ao inicializar cURL. Verifique se a extensão curl está habilitada.'
+            );
         }
 
-        $opts = [
+        curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => http_build_query([
-                'grant_type' => 'client_credentials',
-                'scope'      => implode(' ', self::OAUTH_SCOPES),
-            ]),
+            CURLOPT_POSTFIELDS     => 'grant_type=client_credentials'
+                . '&scope=cobrancas.boletos-info.read'
+                . '+cobrancas.boletos.write'
+                . '+pix.read+pix.write'
+                . '+conta-corrente.saldo.read'
+                . '+conta-corrente.extrato.read',
             CURLOPT_HTTPHEADER     => [
-                'Content-Type: application/x-www-form-urlencoded',
                 'Authorization: Basic ' . $credentials,
+                'Content-Type: application/x-www-form-urlencoded',
             ],
             CURLOPT_TIMEOUT        => 15,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-        ];
+        ]);
 
-        // mTLS: obrigatório em produção, ignorado em sandbox
         if ($this->certPath !== '') {
-            $opts[CURLOPT_SSLCERT] = $this->certPath;
+            curl_setopt($ch, CURLOPT_SSLCERT, $this->certPath);
             if ($this->certKeyPath !== '') {
-                $opts[CURLOPT_SSLKEY] = $this->certKeyPath;
+                curl_setopt($ch, CURLOPT_SSLKEY, $this->certKeyPath);
             }
             if ($this->certPassword !== '') {
-                $opts[CURLOPT_SSLCERTPASSWD] = $this->certPassword;
+                curl_setopt($ch, CURLOPT_SSLCERTPASSWD, $this->certPassword);
             }
-        } elseif ($this->sandbox) {
-            // Sandbox BB pode usar certificado autoassinado
-            $opts[CURLOPT_SSL_VERIFYPEER] = false;
         }
-
-        curl_setopt_array($ch, $opts);
 
         $body     = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -241,7 +216,9 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
         curl_close($ch);
 
         if ($curlErr !== 0) {
-            throw new GatewayException('BB OAuth: erro cURL — ' . curl_strerror($curlErr));
+            throw new GatewayException(
+                'BB OAuth: erro de rede — ' . curl_strerror($curlErr)
+            );
         }
 
         /** @var array<string, mixed> $data */
@@ -249,7 +226,8 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
 
         if ($httpCode !== 200 || empty($data['access_token'])) {
             throw new GatewayException(
-                'BB OAuth: falha na autenticação — ' . ($data['error_description'] ?? $data['error'] ?? 'resposta inesperada'),
+                'BB OAuth: falha na autenticação — '
+                    . ($data['error_description'] ?? $data['error'] ?? 'resposta inesperada'),
                 $httpCode,
                 null,
                 ['response' => $data],
@@ -297,7 +275,7 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
      * @return array<string, mixed>
      * @throws GatewayException
      */
-    private function request(
+    protected function request(
         string $method,
         string $path,
         array  $body  = [],
@@ -311,7 +289,7 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
             $url .= '?' . http_build_query($query);
         }
 
-        // FIX #4 — json_encode verificado antes de usar
+        // json_encode verificado antes de usar — evita enviar payload silenciosamente vazio
         $jsonBody = '';
         if ($body !== []) {
             $encoded = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -323,7 +301,7 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
             $jsonBody = $encoded;
         }
 
-        // FIX #9 — Idempotency-Key determinística: mesmo payload sempre gera a mesma chave.
+        // Idempotency-Key determinística: mesmo payload sempre gera a mesma chave.
         // Garante que retries não criem duplicatas no lado do BB.
         $idempotencyKey = hash('sha256', $method . $path . $jsonBody);
 
@@ -336,13 +314,13 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
             'Idempotency-Key: ' . $idempotencyKey,
         ];
 
-        // FIX #11 — Retry com backoff exponencial para erros transitórios
+        // Retry com backoff exponencial para erros transitórios (1s, 2s, 4s)
         $attempt = 0;
 
         do {
             $attempt++;
 
-            // FIX #3 — Guard: curl_init pode retornar false
+            // Guard: curl_init pode retornar false
             $ch = curl_init($url);
             if ($ch === false) {
                 throw new GatewayException(
@@ -350,386 +328,221 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
                 );
             }
 
-            $opts = [
+            curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CUSTOMREQUEST  => $method,
                 CURLOPT_HTTPHEADER     => $headers,
                 CURLOPT_TIMEOUT        => 30,
-                CURLOPT_CONNECTTIMEOUT => 10,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_SSL_VERIFYHOST => 2,
-            ];
+            ]);
 
-            // FIX #2 — mTLS: aplica certificado client quando configurado
+            if ($jsonBody !== '') {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonBody);
+            }
+
             if ($this->certPath !== '') {
-                $opts[CURLOPT_SSLCERT] = $this->certPath;
+                curl_setopt($ch, CURLOPT_SSLCERT, $this->certPath);
                 if ($this->certKeyPath !== '') {
-                    $opts[CURLOPT_SSLKEY] = $this->certKeyPath;
+                    curl_setopt($ch, CURLOPT_SSLKEY, $this->certKeyPath);
                 }
                 if ($this->certPassword !== '') {
-                    $opts[CURLOPT_SSLCERTPASSWD] = $this->certPassword;
-                }
-            } elseif ($this->sandbox) {
-                $opts[CURLOPT_SSL_VERIFYPEER] = false;
-            }
-
-            if ($method === 'POST') {
-                $opts[CURLOPT_POST]       = true;
-                $opts[CURLOPT_POSTFIELDS] = $jsonBody;
-            } elseif (in_array($method, ['PUT', 'PATCH', 'DELETE'], true)) {
-                $opts[CURLOPT_CUSTOMREQUEST] = $method;
-                if ($jsonBody !== '') {
-                    $opts[CURLOPT_POSTFIELDS] = $jsonBody;
+                    curl_setopt($ch, CURLOPT_SSLCERTPASSWD, $this->certPassword);
                 }
             }
 
-            curl_setopt_array($ch, $opts);
-
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlErr  = curl_errno($ch);
+            $responseBody = curl_exec($ch);
+            $httpCode     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErr      = curl_errno($ch);
             curl_close($ch);
 
             if ($curlErr !== 0) {
-                // Erros de rede são transitórios — vale retry
-                if ($attempt < self::RETRY_MAX) {
-                    usleep(self::RETRY_BASE_MS * (2 ** ($attempt - 1)));
-                    continue;
-                }
-                throw new GatewayException('BB API: erro cURL — ' . curl_strerror($curlErr));
+                throw new GatewayException(
+                    'BB API: erro de rede — ' . curl_strerror($curlErr)
+                );
             }
 
-            /** @var array<string, mixed> $decoded */
-            $decoded = json_decode((string) $response, true) ?? [];
-
-            // HTTP 429 (rate limit) e 503 (indisponível) são transitórios
-            $isTransient = in_array($httpCode, [429, 503], true);
-
-            if ($isTransient && $attempt < self::RETRY_MAX) {
-                // Respeita Retry-After se o BB enviar, senão usa backoff padrão
-                $retryAfterMs = isset($decoded['retryAfter'])
-                    ? (int) $decoded['retryAfter'] * 1_000_000
-                    : self::RETRY_BASE_MS * (2 ** ($attempt - 1));
-
-                usleep($retryAfterMs);
+            if (in_array($httpCode, [429, 503], true) && $attempt < self::MAX_RETRIES) {
+                sleep(2 ** ($attempt - 1));
                 continue;
             }
 
-            if ($httpCode >= 400) {
-                $message = $decoded['mensagem']
-                    ?? $decoded['message']
-                    ?? ($decoded['erros'][0]['mensagem']  ?? null)
-                    ?? ($decoded['errors'][0]['message']  ?? null)
-                    ?? "Requisição falhou com HTTP {$httpCode}";
+            break;
+        } while (true);
 
-                throw new GatewayException((string) $message, $httpCode, null, ['response' => $decoded]);
-            }
+        /** @var array<string, mixed> $data */
+        $data = json_decode((string) $responseBody, true) ?? [];
 
-            return $decoded;
-
-        } while ($attempt < self::RETRY_MAX);
-
-        // Nunca alcançado, mas satisfaz o analisador estático
-        throw new GatewayException('BB API: número máximo de tentativas atingido.');
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  HELPERS PRIVADOS
-    // ══════════════════════════════════════════════════════════
-
-    /**
-     * Gera um txId aleatório para cobranças PIX.
-     * O BACEN exige entre 26 e 35 caracteres alfanuméricos (a-z, A-Z, 0-9).
-     */
-    private function generateTxId(): string
-    {
-        $chars  = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        $length = random_int(26, 35);
-        $txId   = '';
-
-        for ($i = 0; $i < $length; $i++) {
-            $txId .= $chars[random_int(0, strlen($chars) - 1)];
-        }
-
-        return $txId;
-    }
-
-    /**
-     * Resolve o nosso número para um boleto.
-     *
-     * ⚠ ATENÇÃO — CRÍTICO PARA PRODUÇÃO:
-     * O BB rejeita duplicatas de nosso número dentro do mesmo convênio.
-     * O caller DEVE fornecer um número sequencial único via metadata['nossoNumero'].
-     * Use um sequence do banco de dados ou tabela de controle para isso.
-     *
-     * Apenas em sandbox/desenvolvimento, um número aleatório é gerado como fallback
-     * para facilitar testes sem precisar de controle de sequência.
-     *
-     * @throws GatewayException Em produção, se metadata['nossoNumero'] não for informado.
-     */
-    private function resolveNossoNumero(BoletoPaymentRequest $request): string
-    {
-        if (isset($request->metadata['nossoNumero'])) {
-            return str_pad((string) $request->metadata['nossoNumero'], 10, '0', STR_PAD_LEFT);
-        }
-
-        if (!$this->sandbox) {
+        if ($httpCode >= 400) {
             throw new GatewayException(
-                'metadata["nossoNumero"] é obrigatório em produção. ' .
-                'Use um número sequencial único por convênio (ex.: auto-increment do banco de dados).'
+                'BB API: erro HTTP ' . $httpCode . ' — '
+                    . ($data['message'] ?? $data['erros'][0]['mensagem'] ?? 'erro desconhecido'),
+                $httpCode,
+                null,
+                ['response' => $data],
             );
         }
 
-        // Fallback apenas em sandbox — não use em produção
-        return str_pad((string) random_int(1, 9_999_999_999), 10, '0', STR_PAD_LEFT);
-    }
-
-    /**
-     * Remove todos os caracteres não numéricos de um CPF ou CNPJ.
-     */
-    private function sanitizeDocument(string $document): string
-    {
-        return preg_replace('/\D/', '', $document) ?? '';
-    }
-
-    /**
-     * Retorna 1 para CPF ou 2 para CNPJ (formato exigido pelo BB em boletos e TED).
-     */
-    private function documentType(string $sanitizedDocument): int
-    {
-        return strlen($sanitizedDocument) === 11 ? self::DOC_TIPO_CPF : self::DOC_TIPO_CNPJ;
-    }
-
-    /**
-     * Retorna 'cpf' ou 'cnpj' como string (formato exigido pelo BB em PIX).
-     */
-    private function documentTypeString(string $sanitizedDocument): string
-    {
-        return strlen($sanitizedDocument) === 11 ? 'cpf' : 'cnpj';
-    }
-
-    /**
-     * Formata um float como string monetária com 2 casas decimais.
-     * A API do BB exige este formato (ex.: "100.50") nos campos de valor.
-     */
-    private function formatAmount(float $amount): string
-    {
-        return number_format($amount, 2, '.', '');
-    }
-
-    /**
-     * Converte os status da API PIX do BB para o enum PaymentStatus do PaymentHub.
-     *
-     * Status documentados pelo BACEN/BB:
-     *   ATIVA                            → aguardando pagamento
-     *   CONCLUIDA                        → paga com sucesso
-     *   REMOVIDA_PELO_USUARIO_RECEBEDOR  → cancelada pelo beneficiário
-     *   REMOVIDA_PELO_PSP                → cancelada pelo banco/PSP
-     */
-    private function mapPixStatus(string $bbStatus): PaymentStatus
-    {
-        return match (strtoupper($bbStatus)) {
-            'CONCLUIDA'                           => PaymentStatus::APPROVED,
-            'REMOVIDA_PELO_USUARIO_RECEBEDOR',
-            'REMOVIDA_PELO_PSP'                   => PaymentStatus::CANCELLED,
-            default                               => PaymentStatus::PENDING,
-        };
-    }
-
-    /**
-     * Converte os status de boleto da API Cobrança do BB para PaymentStatus.
-     */
-    private function mapBoletoStatus(string $bbStatus): PaymentStatus
-    {
-        return match (strtoupper($bbStatus)) {
-            'LIQUIDADO', 'PAGO'    => PaymentStatus::APPROVED,
-            'VENCIDO'              => PaymentStatus::EXPIRED,
-            'BAIXADO', 'CANCELADO' => PaymentStatus::CANCELLED,
-            default                => PaymentStatus::PENDING,
-        };
+        return $data;
     }
 
     // ══════════════════════════════════════════════════════════
-    //  PIX
+    //  PIX — COBRANÇA IMEDIATA
     // ══════════════════════════════════════════════════════════
 
     /**
      * Cria uma cobrança PIX imediata (QR Code Dinâmico) via API PIX v2.
      *
-     * Endpoint: PUT /pix-bb/v2/cob/{txid}
+     * Endpoint: PUT /pix/v2/cob/{txid}
      *
-     * O BB usa PUT com txid definido pelo cliente, diferente de outros bancos
-     * que usam POST com txid gerado pelo servidor. Isso permite idempotência:
-     * reenviar a mesma requisição com o mesmo txid não cria duplicata.
+     * O txid é gerado automaticamente como UUID v4 sem hifens (32 chars),
+     * conforme exigido pelo BB (alfanumérico, 26-35 chars).
      *
-     * Campos de $request:
-     *   amount            (float)  — valor em reais
-     *   pixKey            (string) — chave PIX; se vazio, usa $this->pixKey
-     *   description       (string) — mensagem para o pagador (solicitacaoPagador)
-     *   customerName      (string) — nome do devedor (opcional, mas recomendado)
-     *   customerDocument  (string) — CPF ou CNPJ do devedor (opcional)
-     *   metadata['expiresIn'] (int) — segundos até expirar (padrão: 86400 = 24 h)
+     * Campos importantes no retorno ($response->metadata):
+     *   - pixCopiaECola : string PIX Copia e Cola para o pagador colar no app
+     *   - location      : URL do QR Code dinâmico
+     *   - txid          : ID da transação no BB
      *
-     * @throws GatewayException Se a chave PIX não estiver configurada.
+     * @throws GatewayException Se a pixKey não estiver configurada.
      */
     public function createPixPayment(PixPaymentRequest $request): PaymentResponse
     {
-        $pixKey = $request->pixKey ?? $this->pixKey;
-
-        if ($pixKey === '') {
+        if ($this->pixKey === '') {
             throw new GatewayException(
-                'Chave PIX é obrigatória. Informe via $request->pixKey ou no construtor do gateway.'
+                'Chave PIX é obrigatória para criar cobranças. Informe $pixKey no construtor.'
             );
         }
 
-        // FIX #7 — Valor mínimo
-        if ($request->getAmount() < self::AMOUNT_MIN) {
+        $amount = (float) ($request->amount ?? $request->getAmount());
+
+        if ($amount < self::AMOUNT_MIN) {
             throw new GatewayException(
-                sprintf('Valor mínimo para cobrança PIX é R$ %.2f. Recebido: R$ %.2f.', self::AMOUNT_MIN, $request->getAmount())
+                sprintf(
+                    'Valor mínimo para cobrança PIX é R$ %.2f. Recebido: R$ %.2f.',
+                    self::AMOUNT_MIN,
+                    $amount
+                )
             );
         }
 
-        $txId    = $this->generateTxId();
-        $expires = (int) ($request->metadata['expiresIn'] ?? 86400);
+        // txid: UUID v4 sem hifens, 32 chars — dentro do range aceito pelo BB (26-35)
+        $txid = str_replace('-', '', sprintf(
+            '%04x%04x%04x%04x%04x%04x%04x%04x',
+            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+            mt_rand(0, 0xffff),
+            mt_rand(0, 0x0fff) | 0x4000,
+            mt_rand(0, 0x3fff) | 0x8000,
+            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+        ));
+
+        $expiresIn = (int) ($request->metadata['expiresIn'] ?? 3600);
 
         $payload = [
-            'calendario' => [
-                'expiracao' => $expires,
+            'calendario'         => ['expiracao' => $expiresIn],
+            'devedor'            => [
+                'cpf'  => $this->sanitizeDocument((string) ($request->customerDocument ?? '')),
+                'nome' => (string) ($request->customerName ?? 'Pagador'),
             ],
-            'valor' => [
-                'original'            => $this->formatAmount($request->getAmount()),
-                'modalidadeAlteracao' => 0, // 0 = pagador não pode alterar o valor
-            ],
-            'chave'              => $pixKey,
-            'solicitacaoPagador' => $request->description ?? 'Pagamento via PIX',
+            'valor'              => ['original' => $this->formatAmount($amount)],
+            'chave'              => $this->pixKey,
+            'solicitacaoPagador' => (string) ($request->description ?? ''),
         ];
 
-        // Devedor é opcional; quando informado, nome e documento são obrigatórios juntos
-        if ($request->customerName !== null && $request->getCustomerDocument() !== null) {
-            $doc     = $this->sanitizeDocument($request->getCustomerDocument());
-            $docType = $this->documentTypeString($doc);
-
-            $payload['devedor'] = [
-                $docType => $doc,
-                'nome'   => $request->customerName,
-            ];
-        }
-
-        $response      = $this->request('PUT', self::PATH_PIX . "/cob/{$txId}", $payload);
-        $txIdRetornado = (string) ($response['txid'] ?? $txId);
+        $response = $this->request('PUT', self::PATH_PIX . "/cob/{$txid}", $payload);
 
         return PaymentResponse::create(
-            success:       isset($response['txid']),
-            transactionId: $txIdRetornado,
-            status:        $this->mapPixStatus((string) ($response['status'] ?? 'ATIVA')),
-            amount:        $request->getAmount(),
-            currency:      'BRL',
+            success:       true,
+            transactionId: (string) ($response['txid'] ?? $txid),
+            status:        PaymentStatus::PENDING,
+            amount:        $amount,
+            currency:      Currency::BRL,
             message:       'Cobrança PIX criada com sucesso',
             rawResponse:   $response,
             metadata:      [
-                'txid'          => $txIdRetornado,
-                'pixCopiaECola' => $response['pixCopiaECola'] ?? null,
-                'qrCode'        => $response['qrCode']        ?? null,
-                'location'      => $response['location']      ?? null,
-                'revisao'       => (int) ($response['revisao'] ?? 0),
-                'status'        => $response['status']        ?? 'ATIVA',
+                'txid'          => (string) ($response['txid']          ?? $txid),
+                'location'      => (string) ($response['location']      ?? ''),
+                'pixCopiaECola' => (string) ($response['pixCopiaECola'] ?? ''),
             ],
         );
     }
 
     /**
-     * Busca os dados de uma cobrança PIX com cache em memória.
+     * Retorna o código PIX Copia e Cola de uma cobrança existente.
      *
-     * Evita chamadas duplicadas à API quando getPixQrCode() e getPixCopyPaste()
-     * são chamados em sequência para o mesmo txid na mesma requisição HTTP.
-     *
-     * @return array<string, mixed>
-     */
-    private function fetchCob(string $txid): array
-    {
-        if (!isset($this->cobCache[$txid])) {
-            $this->cobCache[$txid] = $this->request('GET', self::PATH_PIX . "/cob/{$txid}");
-        }
-
-        return $this->cobCache[$txid];
-    }
-
-    /**
-     * Retorna o QR Code (string EMVCo) de uma cobrança PIX pelo txid.
-     *
-     * Endpoint: GET /pix-bb/v2/cob/{txid}
-     *
-     * Prioriza 'qrCode' (EMV completo); fallback para 'pixCopiaECola'.
-     * Resultado cacheado em memória — chamadas repetidas não geram nova requisição.
-     */
-    public function getPixQrCode(string $transactionId): string
-    {
-        $response = $this->fetchCob($transactionId);
-
-        return (string) ($response['qrCode'] ?? $response['pixCopiaECola'] ?? '');
-    }
-
-    /**
-     * Retorna o código PIX Copia e Cola de uma cobrança.
-     *
-     * Endpoint: GET /pix-bb/v2/cob/{txid}
-     * Resultado cacheado em memória — chamadas repetidas não geram nova requisição.
+     * Endpoint: GET /pix/v2/cob/{txid}
      */
     public function getPixCopyPaste(string $transactionId): string
     {
-        $response = $this->fetchCob($transactionId);
-
+        $response = $this->request('GET', self::PATH_PIX . "/cob/{$transactionId}");
         return (string) ($response['pixCopiaECola'] ?? '');
     }
 
     /**
-     * Solicita a devolução (estorno) de um PIX recebido.
+     * Retorna a URL do QR Code de uma cobrança PIX.
      *
-     * Endpoint: PUT /pix-bb/v2/pix/{e2eId}/devolucao/{id}
-     *
-     * O {e2eId} é o EndToEndId da transação original, disponível no webhook
-     * de confirmação de pagamento (campo 'endToEndId').
-     *
-     * O {id} é gerado por nós: identificador único da devolução (máx. 35 chars).
-     * Usando o mesmo {id} em nova tentativa torna a operação idempotente.
-     *
-     * @param RefundRequest $request
-     *   metadata['e2eId'] — EndToEndId da transação original (preferencial)
-     *   transactionId     — usado como fallback se e2eId não informado
-     *   amount            — valor a devolver (parcial ou total)
+     * Endpoint: GET /pix/v2/cob/{txid}
      */
-    public function refund(RefundRequest $request): RefundResponse
+    public function getPixQrCode(string $transactionId): string
     {
-        $e2eId  = (string) ($request->metadata['e2eId'] ?? $request->transactionId);
-        $amount = (float) ($request->amount ?? 0);
+        $response = $this->request('GET', self::PATH_PIX . "/cob/{$transactionId}");
+        return (string) ($response['location'] ?? '');
+    }
 
-        if ($amount < self::AMOUNT_MIN) {
-            throw new GatewayException(
-                sprintf('Valor mínimo para devolução PIX é R$ %.2f. Recebido: R$ %.2f.', self::AMOUNT_MIN, $amount)
-            );
-        }
+    // ══════════════════════════════════════════════════════════
+    //  CARTÃO DE CRÉDITO — NÃO SUPORTADO (stubs obrigatórios da interface)
+    // ══════════════════════════════════════════════════════════
 
-        // FIX #10 — ID determinístico: mesmos e2eId + amount sempre geram o mesmo devolutionId.
-        // Garante idempotência em retries — o BB ignora segunda tentativa com mesmo ID.
-        $devolutionId = substr(hash('sha256', $e2eId . number_format($amount, 2, '.', '')), 0, 35);
-
-        $payload = [
-            'valor' => $this->formatAmount((float) ($request->amount ?? 0)),
-        ];
-
-        $response = $this->request(
-            'PUT',
-            self::PATH_PIX . "/pix/{$e2eId}/devolucao/{$devolutionId}",
-            $payload,
+    /** @throws GatewayException */
+    public function createCreditCardPayment(CreditCardPaymentRequest $request): PaymentResponse
+    {
+        throw new GatewayException(
+            'Cartão de crédito não disponível no Banco do Brasil via API. Use Asaas, PagarMe, Adyen ou Stripe.'
         );
+    }
 
-        return RefundResponse::create(
-            success:       isset($response['id']),
-            refundId:      (string) ($response['id']     ?? $devolutionId),
-            transactionId: $e2eId,
-            amount:        (float)  ($response['valor']  ?? $request->amount ?? 0),
-            status:        (string) ($response['status'] ?? 'EM_PROCESSAMENTO'),
-            message:       'Devolução PIX solicitada com sucesso',
-            rawResponse:   $response,
+    /**
+     * FIX #14 — Método obrigatório da interface que estava ausente no arquivo original.
+     *
+     * @throws GatewayException
+     */
+    public function tokenizeCard(array $cardData): string
+    {
+        throw new GatewayException(
+            'Tokenização de cartão não disponível no Banco do Brasil. Use Asaas, PagarMe, Adyen ou Stripe.'
+        );
+    }
+
+    /**
+     * FIX #15 — Método obrigatório da interface que estava ausente no arquivo original.
+     *
+     * @throws GatewayException
+     */
+    public function capturePreAuthorization(string $transactionId, ?float $amount = null): PaymentResponse
+    {
+        throw new GatewayException(
+            'Pré-autorização não disponível no Banco do Brasil. Use Adyen, Stripe ou PagarMe.'
+        );
+    }
+
+    /**
+     * FIX #16 — Método obrigatório da interface que estava ausente no arquivo original.
+     *
+     * @throws GatewayException
+     */
+    public function cancelPreAuthorization(string $transactionId): PaymentResponse
+    {
+        throw new GatewayException(
+            'Pré-autorização não disponível no Banco do Brasil. Use Adyen, Stripe ou PagarMe.'
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  CARTÃO DE DÉBITO — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /** @throws GatewayException */
+    public function createDebitCardPayment(DebitCardPaymentRequest $request): PaymentResponse
+    {
+        throw new GatewayException(
+            'Cartão de débito não disponível no Banco do Brasil. Use Asaas ou PagarMe.'
         );
     }
 
@@ -742,8 +555,9 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
      *
      * Endpoint: POST /cobrancas/v2/boletos
      *
-     * Dados do convênio (configurados no construtor):
-     *   $convenio, $carteira, $variacaoCarteira
+     * FIX #4 — Retorno corrigido de BoletoResponse para PaymentResponse,
+     * conforme assinatura da PaymentGatewayInterface. Os dados do boleto
+     * (linhaDigitavel, boletoUrl, etc.) são retornados em metadata.
      *
      * Suporte a:
      *   - Boleto simples
@@ -751,12 +565,9 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
      *   - Juros mora via metadata['fine'] (% ao mês)
      *   - Desconto via metadata['discount'] (R$ fixo até o vencimento)
      *
-     * Campos de endereço via $request->metadata:
-     *   address, neighborhood, city, cityCode (IBGE int), state, zipCode
-     *
      * @throws GatewayException Se o convênio não estiver configurado.
      */
-    public function createBoleto(BoletoPaymentRequest $request): BoletoResponse
+    public function createBoleto(BoletoPaymentRequest $request): PaymentResponse
     {
         if ($this->convenio === 0) {
             throw new GatewayException(
@@ -764,14 +575,17 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
             );
         }
 
-        // FIX #7 — Valor mínimo
         if ($request->getAmount() < self::AMOUNT_MIN) {
             throw new GatewayException(
-                sprintf('Valor mínimo para boleto é R$ %.2f. Recebido: R$ %.2f.', self::AMOUNT_MIN, $request->getAmount())
+                sprintf(
+                    'Valor mínimo para boleto é R$ %.2f. Recebido: R$ %.2f.',
+                    self::AMOUNT_MIN,
+                    $request->getAmount()
+                )
             );
         }
 
-        // FIX #1 — nossoNumero sequencial obrigatório em produção
+        // nossoNumero sequencial obrigatório em produção
         $nossoNumero = $this->resolveNossoNumero($request);
         $hoje        = new DateTime();
         $vencimento  = $request->dueDate !== null
@@ -782,22 +596,20 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
         $docType = $this->documentType($doc);
 
         $payload = [
-            'numeroConvenio'         => $this->convenio,
-            'numeroCarteira'         => $this->carteira,
-            'numeroVariacaoCarteira' => $this->variacaoCarteira,
-            'codigoModalidade'       => 1,
-            'dataEmissao'            => $hoje->format('d.m.Y'),
-            'dataVencimento'         => $vencimento,
-
-            // FIX #5 — valor como string formatada, não float direto
-            'valorOriginal'          => $this->formatAmount($request->getAmount()),
-
-            'codigoAceite'           => 'N',
-            'codigoTipoTitulo'       => 2,
-            'descricaoTipoTitulo'    => 'DM',
+            'numeroConvenio'                       => $this->convenio,
+            'numeroCarteira'                       => $this->carteira,
+            'numeroVariacaoCarteira'               => $this->variacaoCarteira,
+            'codigoModalidade'                     => 1,
+            'dataEmissao'                          => $hoje->format('d.m.Y'),
+            'dataVencimento'                       => $vencimento,
+            // valor como string formatada — BB rejeita float com precisão inesperada
+            'valorOriginal'                        => $this->formatAmount($request->getAmount()),
+            'codigoAceite'                         => 'N',
+            'codigoTipoTitulo'                     => 2,
+            'descricaoTipoTitulo'                  => 'DM',
             'indicadorPermissaoRecebimentoParcial' => 'N',
-            'numeroTituloBeneficiario' => $nossoNumero,
-            'numeroTituloCliente'      => '000' . $this->convenio . $nossoNumero,
+            'numeroTituloBeneficiario'             => $nossoNumero,
+            'numeroTituloCliente'                  => '000' . $this->convenio . $nossoNumero,
 
             'pagador' => [
                 'tipoInscricao'   => $docType,
@@ -808,62 +620,61 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
                 'cidade'          => (string) ($request->metadata['city']         ?? ''),
                 'codigoCidade'    => (int)    ($request->metadata['cityCode']     ?? 0),
                 'uf'              => (string) ($request->metadata['state']        ?? 'SP'),
-                'cep'             => (string) preg_replace('/\D/', '', (string) ($request->metadata['zipCode'] ?? '00000000')),
-                'telefone'        => (string) preg_replace('/\D/', '', (string) ($request->customerPhone      ?? '')),
+                'cep'             => (string) preg_replace(
+                    '/\D/',
+                    '',
+                    (string) ($request->metadata['zipCode'] ?? '00000000')
+                ),
+                'telefone'        => (string) preg_replace(
+                    '/\D/',
+                    '',
+                    (string) ($request->customerPhone ?? '')
+                ),
             ],
 
             'mensagemBloquetoOcorrencia' => (string) ($request->description ?? ''),
         ];
 
-        // Juros mora (opcional) — tipo 2 = percentual mensal
+        // Boleto Híbrido (Boleto + PIX no mesmo título)
+        if (!empty($request->metadata['hibrido'])) {
+            $payload['indicadorPix'] = 'S';
+        }
+
+        // Juros mora (% ao mês)
         if (!empty($request->metadata['fine'])) {
             $payload['jurosMora'] = [
                 'tipo'  => 2,
-                'valor' => (float) $request->metadata['fine'],
+                'valor' => $this->formatAmount((float) $request->metadata['fine']),
             ];
         }
 
-        // Desconto (opcional) — tipo 1 = valor fixo até a data de vencimento
+        // Desconto fixo até o vencimento
         if (!empty($request->metadata['discount'])) {
             $payload['desconto'] = [
                 'tipo'          => 1,
                 'dataExpiracao' => $vencimento,
-                'valor'         => (float) $request->metadata['discount'],
+                'valor'         => $this->formatAmount((float) $request->metadata['discount']),
             ];
         }
 
-        // Boleto Híbrido: ativa QR Code PIX embutido no mesmo documento
-        $isHibrido = (bool) ($request->metadata['hibrido'] ?? false);
-        if ($isHibrido) {
-            $payload['indicadorPix'] = 'S';
-        }
+        $response = $this->request('POST', self::PATH_BOLETO . '/boletos', $payload);
 
-        $response      = $this->request('POST', self::PATH_BOLETO . '/boletos', $payload);
-        $boletoId      = (string) ($response['numero']              ?? $nossoNumero);
-        $boletoUrl     = (string) ($response['linkImagemBoleto']    ?? '');
-        $barCode       = (string) ($response['codigoBarraNumerico'] ?? '');
-        $linhaDigitavel= (string) ($response['linhaDigitavel']      ?? '');
-
-        return BoletoResponse::create(
-            success:        isset($response['numero']),
-            boletoId:       $boletoId,
-            boletoUrl:      $boletoUrl,
-            barCode:        $barCode,
-            linhaDigitavel: $linhaDigitavel,
-            dueDate:        $vencimento,
-            amount:         $request->getAmount(),
-            status:         PaymentStatus::PENDING,
-            message:        $isHibrido
-                                ? 'Boleto Híbrido (Boleto + PIX) registrado com sucesso'
-                                : 'Boleto registrado com sucesso',
-            rawResponse:    $response,
-            metadata:       [
+        return PaymentResponse::create(
+            success:       true,
+            transactionId: (string) ($response['numero'] ?? $nossoNumero),
+            status:        PaymentStatus::PENDING,
+            amount:        $request->getAmount(),
+            currency:      Currency::BRL,
+            message:       'Boleto registrado com sucesso',
+            rawResponse:   $response,
+            metadata:      [
                 'nossoNumero'    => $nossoNumero,
-                'numeroConvenio' => $this->convenio,
-                'hibrido'        => $isHibrido,
-                'urlPix'         => $response['urlPix']        ?? null,
-                'qrCodePix'      => $response['qrCodePix']     ?? null,
-                'pixCopiaECola'  => $response['pixCopiaECola'] ?? null,
+                'linhaDigitavel' => $response['linhaDigitavel']      ?? '',
+                'boletoUrl'      => $response['linkImagemBoleto']    ?? '',
+                'codigoBarras'   => $response['codigoBarraNumerico'] ?? null,
+                'qrCodePix'      => $response['qrCodePix']           ?? null,
+                'pixCopiaECola'  => $response['pixCopiaECola']       ?? null,
+                'dueDate'        => $request->dueDate ?? (new DateTime('+3 days'))->format('Y-m-d'),
             ],
         );
     }
@@ -885,41 +696,434 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
         return (string) ($response['linkImagemBoleto'] ?? '');
     }
 
-	/**
-	 * Solicita baixa (cancelamento) de um boleto registrado.
-	 *
-	 * Endpoint: POST /cobrancas/v2/boletos/{numero}/baixar
-	 *
-	 * ⚠ ATENÇÃO: a baixa é irreversível. Boleto já pago deve ser
-	 * tratado direto com o gerente do Banco do Brasil.
-	 *
-	 * Retorna PaymentResponse com success = true quando codigoErroRegistro = 0,
-	 * ou success = false com a mensagem de erro do BB em caso de falha.
-	 */
-	public function cancelBoleto(string $transactionId): PaymentResponse
-	{
-		$response = $this->request(
-			'POST',
-			self::PATH_BOLETO . "/boletos/{$transactionId}/baixar",
-			['numeroConvenio' => $this->convenio],
-		);
+    /**
+     * Solicita baixa (cancelamento) de um boleto registrado.
+     *
+     * Endpoint: POST /cobrancas/v2/boletos/{numero}/baixar
+     *
+     * ⚠ ATENÇÃO: a baixa é irreversível. Boleto já pago deve ser
+     * tratado direto com o gerente do Banco do Brasil.
+     *
+     * Retorna PaymentResponse com success = true quando codigoErroRegistro = 0,
+     * ou success = false com a mensagem de erro do BB em caso de falha (sem lançar exceção).
+     */
+    public function cancelBoleto(string $transactionId): PaymentResponse
+    {
+        $response = $this->request(
+            'POST',
+            self::PATH_BOLETO . "/boletos/{$transactionId}/baixar",
+            ['numeroConvenio' => $this->convenio],
+        );
 
-		$success = ((int) ($response['codigoErroRegistro'] ?? 0)) === 0;
-		$message = $success
-			? 'Baixa solicitada com sucesso'
-			: (string) ($response['mensagem'] ?? 'Erro ao solicitar baixa do boleto');
+        $success = ((int) ($response['codigoErroRegistro'] ?? 0)) === 0;
+        $message = $success
+            ? 'Baixa solicitada com sucesso'
+            : (string) ($response['mensagem'] ?? 'Erro ao solicitar baixa do boleto');
 
-		return PaymentResponse::create(
-			success:         $success,
-			transactionId:   $transactionId,
-			status:          $success ? PaymentStatus::CANCELLED : PaymentStatus::FAILED,
-			amount:          0,
-			currency:        Currency::BRL,
-			message:         $message,
-			gatewayResponse: $response,
-			rawResponse:     $response,
-		);
-	}
+        return PaymentResponse::create(
+            success:         $success,
+            transactionId:   $transactionId,
+            status:          $success ? PaymentStatus::CANCELLED : PaymentStatus::FAILED,
+            amount:          0,
+            currency:        Currency::BRL,
+            message:         $message,
+            gatewayResponse: $response,
+            rawResponse:     $response,
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ASSINATURAS — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /** @throws GatewayException */
+    public function createSubscription(SubscriptionRequest $request): SubscriptionResponse
+    {
+        throw new GatewayException(
+            'Assinaturas não disponíveis no Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
+        );
+    }
+
+    /** @throws GatewayException */
+    public function cancelSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        throw new GatewayException('Assinaturas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function suspendSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        throw new GatewayException('Assinaturas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function reactivateSubscription(string $subscriptionId): SubscriptionResponse
+    {
+        throw new GatewayException('Assinaturas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function updateSubscription(string $subscriptionId, array $data): SubscriptionResponse
+    {
+        throw new GatewayException('Assinaturas não disponíveis no Banco do Brasil.');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  TRANSAÇÕES — CONSULTA E LISTAGEM
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Consulta o status de uma cobrança PIX ou boleto.
+     *
+     * FIX #5 — Retorno corrigido para TransactionStatusResponse conforme
+     * PaymentGatewayInterface. O original retornava PaymentResponse.
+     *
+     * Tenta primeiro como PIX (GET /pix/v2/cob/{txid});
+     * se a chamada falhar (404), tenta como boleto.
+     *
+     * @throws GatewayException
+     */
+    public function getTransactionStatus(string $transactionId): TransactionStatusResponse
+    {
+        // Tenta consultar como cobrança PIX primeiro
+        try {
+            $response = $this->request('GET', self::PATH_PIX . "/cob/{$transactionId}");
+
+            $bbStatus = strtoupper((string) ($response['status'] ?? 'ATIVA'));
+            $status   = match ($bbStatus) {
+                'CONCLUIDA'                        => PaymentStatus::PAID,
+                'REMOVIDA_PELO_USUARIO_RECEBEDOR',
+                'REMOVIDA_PELO_PSP'                => PaymentStatus::CANCELLED,
+                default                            => PaymentStatus::PENDING,
+            };
+
+            return TransactionStatusResponse::create(
+                success:       true,
+                transactionId: $transactionId,
+                status:        $status,
+                amount:        (float) ($response['valor']['original'] ?? 0),
+                currency:      Currency::BRL,
+                rawResponse:   $response,
+            );
+        } catch (GatewayException) {
+            // Não é cobrança PIX — tenta como boleto
+        }
+
+        $response   = $this->request(
+            'GET',
+            self::PATH_BOLETO . "/boletos/{$transactionId}",
+            [],
+            ['numeroConvenio' => $this->convenio],
+        );
+
+        $bbSituacao = strtoupper((string) ($response['situacao'] ?? 'ABERTO'));
+        $status     = match ($bbSituacao) {
+            'LIQUIDADA', 'PAGO' => PaymentStatus::PAID,
+            'BAIXADA'           => PaymentStatus::CANCELLED,
+            'VENCIDA'           => PaymentStatus::FAILED,
+            default             => PaymentStatus::PENDING,
+        };
+
+        return TransactionStatusResponse::create(
+            success:       true,
+            transactionId: $transactionId,
+            status:        $status,
+            amount:        (float) ($response['valor']['original'] ?? 0),
+            currency:      Currency::BRL,
+            rawResponse:   $response,
+        );
+    }
+
+    /**
+     * Lista cobranças PIX em um intervalo de datas.
+     *
+     * Endpoint: GET /pix/v2/cob?inicio={inicio}&fim={fim}
+     *
+     * @param array<string, mixed> $filters Filtros opcionais:
+     *   - inicio   : string datetime ISO-8601 (padrão: 30 dias atrás)
+     *   - fim      : string datetime ISO-8601 (padrão: agora)
+     *   - status   : ATIVA | CONCLUIDA | REMOVIDA_PELO_USUARIO_RECEBEDOR
+     *   - pagina   : int (paginação)
+     *
+     * @return array<string, mixed>
+     * @throws GatewayException
+     */
+    public function listTransactions(array $filters = []): array
+    {
+        $query = [
+            'inicio' => $filters['inicio'] ?? (new DateTime('-30 days'))->format(DateTimeInterface::ATOM),
+            'fim'    => $filters['fim']    ?? (new DateTime())->format(DateTimeInterface::ATOM),
+        ];
+
+        if (isset($filters['status'])) {
+            $query['status'] = $filters['status'];
+        }
+        if (isset($filters['pagina'])) {
+            $query['paginacao.paginaAtual'] = (int) $filters['pagina'];
+        }
+
+        return $this->request('GET', self::PATH_PIX . '/cob', [], $query);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ESTORNOS E CHARGEBACKS
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Solicita devolução (estorno total) de um PIX recebido.
+     *
+     * Endpoint: PUT /pix/v2/pix/{e2eId}/devolucao/{devolutionId}
+     *
+     * O devolutionId é derivado deterministicamente do e2eId + valor,
+     * garantindo idempotência em retries — o BB ignora tentativas com mesmo ID.
+     *
+     * @throws GatewayException Se o valor for menor que o mínimo.
+     */
+    public function refund(RefundRequest $request): RefundResponse
+    {
+        $e2eId  = (string) ($request->metadata['e2eId'] ?? $request->transactionId);
+        $amount = (float) ($request->amount ?? 0);
+
+        if ($amount < self::AMOUNT_MIN) {
+            throw new GatewayException(
+                sprintf(
+                    'Valor mínimo para devolução PIX é R$ %.2f. Recebido: R$ %.2f.',
+                    self::AMOUNT_MIN,
+                    $amount
+                )
+            );
+        }
+
+        $devolutionId = substr(
+            hash('sha256', $e2eId . number_format($amount, 2, '.', '')),
+            0,
+            35
+        );
+
+        $response = $this->request(
+            'PUT',
+            self::PATH_PIX . "/pix/{$e2eId}/devolucao/{$devolutionId}",
+            ['valor' => $this->formatAmount($amount)],
+        );
+
+        return RefundResponse::create(
+            success:       isset($response['id']),
+            refundId:      (string) ($response['id']     ?? $devolutionId),
+            transactionId: $e2eId,
+            amount:        (float)  ($response['valor']  ?? $amount),
+            status:        (string) ($response['status'] ?? 'EM_PROCESSAMENTO'),
+            message:       'Devolução PIX solicitada com sucesso',
+            rawResponse:   $response,
+        );
+    }
+
+    /**
+     * Solicita devolução parcial de um PIX recebido.
+     *
+     * FIX #6 — Método obrigatório da interface que estava ausente no arquivo original.
+     *
+     * @throws GatewayException Se o valor for menor que o mínimo.
+     */
+    public function partialRefund(string $transactionId, float $amount): RefundResponse
+    {
+        if ($amount < self::AMOUNT_MIN) {
+            throw new GatewayException(
+                sprintf(
+                    'Valor mínimo para devolução parcial PIX é R$ %.2f. Recebido: R$ %.2f.',
+                    self::AMOUNT_MIN,
+                    $amount
+                )
+            );
+        }
+
+        // Sufixo 'partial' diferencia o ID do full refund para o mesmo par e2eId+amount
+        $devolutionId = substr(
+            hash('sha256', $transactionId . number_format($amount, 2, '.', '') . 'partial'),
+            0,
+            35
+        );
+
+        $response = $this->request(
+            'PUT',
+            self::PATH_PIX . "/pix/{$transactionId}/devolucao/{$devolutionId}",
+            ['valor' => $this->formatAmount($amount)],
+        );
+
+        return RefundResponse::create(
+            success:       isset($response['id']),
+            refundId:      (string) ($response['id']     ?? $devolutionId),
+            transactionId: $transactionId,
+            amount:        $amount,
+            status:        (string) ($response['status'] ?? 'EM_PROCESSAMENTO'),
+            message:       'Devolução parcial PIX solicitada com sucesso',
+            rawResponse:   $response,
+        );
+    }
+
+    /**
+     * Lista chargebacks (contestações).
+     *
+     * FIX #7 — Método obrigatório da interface que estava ausente no arquivo original.
+     * O BB não possui API pública de chargebacks — retorna array vazio.
+     *
+     * @return array<string, mixed>
+     */
+    public function getChargebacks(array $filters = []): array
+    {
+        // O Banco do Brasil não expõe API de chargebacks via portal de desenvolvedores.
+        // Chargebacks são tratados diretamente pelo gerente de relacionamento BB.
+        return [];
+    }
+
+    /**
+     * Contesta um chargeback.
+     *
+     * FIX #8 — Método obrigatório da interface que estava ausente no arquivo original.
+     *
+     * @throws GatewayException
+     */
+    public function disputeChargeback(string $chargebackId, array $evidence): PaymentResponse
+    {
+        throw new GatewayException(
+            'Contestação de chargebacks não disponível via API do Banco do Brasil. '
+            . 'Entre em contato com seu gerente de relacionamento BB.'
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  SPLIT DE PAGAMENTO — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * FIX #9 — Assinatura corrigida para createSplitPayment(SplitPaymentRequest)
+     * conforme PaymentGatewayInterface. O original declarava splitPayment(array).
+     *
+     * @throws GatewayException
+     */
+    public function createSplitPayment(SplitPaymentRequest $request): PaymentResponse
+    {
+        throw new GatewayException(
+            'Split de pagamento não disponível no Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  SUB-CONTAS — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * FIX #10 — Assinatura corrigida para SubAccountRequest → SubAccountResponse
+     * conforme PaymentGatewayInterface. O original usava array → array.
+     *
+     * @throws GatewayException
+     */
+    public function createSubAccount(SubAccountRequest $request): SubAccountResponse
+    {
+        throw new GatewayException('Sub-contas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function updateSubAccount(string $subAccountId, array $data): SubAccountResponse
+    {
+        throw new GatewayException('Sub-contas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function getSubAccount(string $subAccountId): SubAccountResponse
+    {
+        throw new GatewayException('Sub-contas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function activateSubAccount(string $subAccountId): SubAccountResponse
+    {
+        throw new GatewayException('Sub-contas não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function deactivateSubAccount(string $subAccountId): SubAccountResponse
+    {
+        throw new GatewayException('Sub-contas não disponíveis no Banco do Brasil.');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  WALLETS — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * FIX #11 — Assinatura corrigida para WalletRequest → WalletResponse
+     * conforme PaymentGatewayInterface. O original usava array → array.
+     *
+     * @throws GatewayException
+     */
+    public function createWallet(WalletRequest $request): WalletResponse
+    {
+        throw new GatewayException(
+            'Wallets devem ser gerenciadas na camada de aplicação, não via API Banco do Brasil.'
+        );
+    }
+
+    /**
+     * FIX #12 — Método renomeado de creditWallet() para addBalance() conforme interface.
+     *
+     * @throws GatewayException
+     */
+    public function addBalance(string $walletId, float $amount): WalletResponse
+    {
+        throw new GatewayException('Wallets não disponíveis no Banco do Brasil.');
+    }
+
+    /**
+     * FIX #13 — Método renomeado de debitWallet() para deductBalance() conforme interface.
+     *
+     * @throws GatewayException
+     */
+    public function deductBalance(string $walletId, float $amount): WalletResponse
+    {
+        throw new GatewayException('Wallets não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function getWalletBalance(string $walletId): BalanceResponse
+    {
+        throw new GatewayException('Wallets não disponíveis no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function transferBetweenWallets(string $fromWalletId, string $toWalletId, float $amount): TransferResponse
+    {
+        throw new GatewayException('Wallets não disponíveis no Banco do Brasil.');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ESCROW — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
+
+    /** @throws GatewayException */
+    public function holdInEscrow(EscrowRequest $request): EscrowResponse
+    {
+        throw new GatewayException(
+            'Escrow/Custódia não disponível no Banco do Brasil. Use C6Bank ou PagarMe.'
+        );
+    }
+
+    /** @throws GatewayException */
+    public function releaseEscrow(string $escrowId): EscrowResponse
+    {
+        throw new GatewayException('Escrow não disponível no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function partialReleaseEscrow(string $escrowId, float $amount): EscrowResponse
+    {
+        throw new GatewayException('Escrow não disponível no Banco do Brasil.');
+    }
+
+    /** @throws GatewayException */
+    public function cancelEscrow(string $escrowId): EscrowResponse
+    {
+        throw new GatewayException('Escrow não disponível no Banco do Brasil.');
+    }
 
     // ══════════════════════════════════════════════════════════
     //  TRANSFERÊNCIAS — PIX / TED
@@ -928,514 +1132,143 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
     /**
      * Realiza uma transferência bancária com roteamento automático.
      *
-     * Regra de roteamento:
-     *   metadata['pixKey'] informado → PIX (instantâneo)
-     *   metadata['pixKey'] ausente   → TED (mesmo dia útil)
+     * Roteamento:
+     *   - Se metadata['pixKey'] estiver presente → usa PIX
+     *   - Caso contrário → usa TED (exige bankCode, agency, account, accountDigit)
      *
-     * Campos de $request:
-     *   amount              — valor em reais
-     *   beneficiaryName     — nome do destinatário
-     *   beneficiaryDocument — CPF ou CNPJ do destinatário
-     *   description         — finalidade/descrição
-     *   metadata['pixKey']  — chave PIX (para roteamento via PIX)
-     *   bankCode            — código COMPE do banco destino (para TED)
-     *   agency              — agência do banco destino (para TED)
-     *   account             — número da conta destino (para TED)
-     *   accountDigit        — dígito verificador da conta (para TED)
-     *   accountType         — 'checking' | 'savings' (para TED)
+     * @throws GatewayException
      */
     public function transfer(TransferRequest $request): TransferResponse
     {
-        $pixKey = (string) ($request->metadata['pixKey'] ?? '');
+        $pixKey = $request->metadata['pixKey'] ?? null;
 
-        return $pixKey !== ''
-            ? $this->sendViaPix($request, $pixKey)
-            : $this->sendViaTed($request);
+        if ($pixKey !== null) {
+            return $this->transferViaPix($request, (string) $pixKey);
+        }
+
+        return $this->transferViaTed($request);
     }
 
     /**
-     * Envia um PIX avulso para outra conta via chave PIX.
-     *
-     * Endpoint: POST /pagamentos/v1/pix
+     * Transferência via PIX (chave PIX do beneficiário).
      */
-    private function sendViaPix(TransferRequest $request, string $pixKey): TransferResponse
+    private function transferViaPix(TransferRequest $request, string $pixKey): TransferResponse
     {
-        $doc     = $this->sanitizeDocument((string) ($request->beneficiaryDocument ?? ''));
-        $docType = $this->documentTypeString($doc);
+        $amount = (float) ($request->amount ?? $request->getAmount());
 
         $payload = [
-            'valor'        => $this->formatAmount($request->amount),
-            'chave'        => $pixKey,
-            'descricao'    => $request->description ?? 'Transferência via PIX',
-            'destinatario' => [
-                $docType => $doc,
-                'nome'   => (string) ($request->beneficiaryName ?? ''),
-            ],
+            'valor'            => $this->formatAmount($amount),
+            'chave'            => $pixKey,
+            'descricao'        => (string) ($request->description ?? ''),
+            'nomeDestinatario' => (string) ($request->beneficiaryName ?? ''),
+            'cpfCnpj'          => $this->sanitizeDocument((string) ($request->beneficiaryDocument ?? '')),
         ];
 
-        $response = $this->request('POST', self::PATH_PAGTOS . '/pix', $payload);
+        $response = $this->request('POST', self::PATH_PIX . '/pix', $payload);
 
         return TransferResponse::create(
             success:     true,
-            transferId:  (string) ($response['idPagamento'] ?? $response['id'] ?? uniqid('PIX-BB-', true)),
-            amount:      $request->amount,
-            status:      strtolower((string) ($response['status'] ?? 'processing')),
-            currency:    'BRL',
-            message:     'Transferência via PIX iniciada com sucesso',
+            transferId:  (string) ($response['idPagamento'] ?? uniqid('bb_pix_')),
+            amount:      $amount,
+            currency:    Currency::BRL,
+            status:      PaymentStatus::PENDING,
+            message:     'Transferência PIX enviada com sucesso',
             rawResponse: array_merge($response, ['_method' => 'pix']),
         );
     }
 
     /**
-     * Envia uma TED (Transferência Eletrônica Disponível).
-     *
-     * Endpoint: POST /pagamentos/v1/ted
+     * Transferência via TED (dados bancários do beneficiário).
      */
-    private function sendViaTed(TransferRequest $request): TransferResponse
+    private function transferViaTed(TransferRequest $request): TransferResponse
     {
-        $doc       = $this->sanitizeDocument((string) ($request->beneficiaryDocument ?? ''));
-        $docType   = $this->documentType($doc);
-        $tipoConta = ($request->accountType ?? 'checking') === 'savings' ? 'POUPANCA' : 'CORRENTE';
+        $amount = (float) ($request->amount ?? $request->getAmount());
 
         $payload = [
-            'valor'        => $this->formatAmount($request->amount),
-            'descricao'    => $request->description ?? 'Transferência TED',
-            'contaDestino' => [
-                'banco'            => (string) ($request->bankCode     ?? '001'),
-                'agencia'          => (string) ($request->agency       ?? ''),
-                'conta'            => (string) ($request->account      ?? ''),
-                'digitoConta'      => (string) ($request->accountDigit ?? ''),
-                'tipoContaDestino' => $tipoConta,
-            ],
-            'beneficiario' => [
-                'tipoInscricao'   => $docType,
-                'numeroInscricao' => $doc,
-                'nome'            => (string) ($request->beneficiaryName ?? ''),
+            'valor'        => $this->formatAmount($amount),
+            'descricao'    => (string) ($request->description ?? ''),
+            'destinatario' => [
+                'nome'        => (string) ($request->beneficiaryName     ?? ''),
+                'cpfCnpj'     => $this->sanitizeDocument((string) ($request->beneficiaryDocument ?? '')),
+                'codigoBanco' => (string) ($request->bankCode            ?? ''),
+                'agencia'     => (string) ($request->agency              ?? ''),
+                'conta'       => (string) ($request->account             ?? ''),
+                'digitoConta' => (string) ($request->accountDigit        ?? ''),
+                'tipoConta'   => $request->accountType === 'savings' ? 'POUPANCA' : 'CORRENTE',
             ],
         ];
 
-        $response = $this->request('POST', self::PATH_PAGTOS . '/ted', $payload);
+        $response = $this->request('POST', self::PATH_PAG . '/lotes-pagamentos/ted', $payload);
 
         return TransferResponse::create(
             success:     true,
-            transferId:  (string) ($response['idPagamento'] ?? $response['id'] ?? uniqid('TED-BB-', true)),
-            amount:      $request->amount,
-            status:      strtolower((string) ($response['status'] ?? 'processing')),
-            currency:    'BRL',
-            message:     'Transferência TED iniciada com sucesso',
+            transferId:  (string) ($response['idPagamento'] ?? uniqid('bb_ted_')),
+            amount:      $amount,
+            currency:    Currency::BRL,
+            status:      PaymentStatus::PENDING,
+            message:     'Transferência TED enviada com sucesso',
             rawResponse: array_merge($response, ['_method' => 'ted']),
         );
     }
 
     /**
-     * Agenda uma transferência (PIX ou TED) para uma data futura.
+     * Agenda uma transferência para uma data futura.
      *
-     * O campo 'dataAgendamento' instrui o BB a processar na data informada.
-     * O roteamento PIX vs TED segue a mesma lógica do método transfer().
-     *
-     * @param TransferRequest $request Dados da transferência.
-     * @param string          $date    Data alvo no formato YYYY-MM-DD.
+     * @throws GatewayException
      */
     public function scheduleTransfer(TransferRequest $request, string $date): TransferResponse
     {
-        $pixKey   = (string) ($request->metadata['pixKey'] ?? '');
-        $endpoint = $pixKey !== '' ? '/pix' : '/ted';
-        $doc      = $this->sanitizeDocument((string) ($request->beneficiaryDocument ?? ''));
+        $request->metadata = array_merge($request->metadata ?? [], ['dataAgendamento' => $date]);
+        return $this->transfer($request);
+    }
 
-        $payload = [
-            'valor'           => $this->formatAmount($request->amount),
-            'dataAgendamento' => $date,
-            'descricao'       => $request->description ?? 'Transferência agendada',
-        ];
-
-        if ($pixKey !== '') {
-            $docType = $this->documentTypeString($doc);
-            $payload['chave']        = $pixKey;
-            $payload['destinatario'] = [
-                $docType => $doc,
-                'nome'   => (string) ($request->beneficiaryName ?? ''),
-            ];
-        } else {
-            $tipoConta = ($request->accountType ?? 'checking') === 'savings' ? 'POUPANCA' : 'CORRENTE';
-            $payload['contaDestino'] = [
-                'banco'            => (string) ($request->bankCode     ?? '001'),
-                'agencia'          => (string) ($request->agency       ?? ''),
-                'conta'            => (string) ($request->account      ?? ''),
-                'digitoConta'      => (string) ($request->accountDigit ?? ''),
-                'tipoContaDestino' => $tipoConta,
-            ];
-            $payload['beneficiario'] = [
-                'tipoInscricao'   => $this->documentType($doc),
-                'numeroInscricao' => $doc,
-                'nome'            => (string) ($request->beneficiaryName ?? ''),
-            ];
-        }
-
-        $response = $this->request('POST', self::PATH_PAGTOS . $endpoint, $payload);
+    /**
+     * Cancela uma transferência agendada.
+     *
+     * @throws GatewayException
+     */
+    public function cancelScheduledTransfer(string $transferId): TransferResponse
+    {
+        $response = $this->request('DELETE', self::PATH_PAG . "/lotes-pagamentos/{$transferId}");
 
         return TransferResponse::create(
             success:     true,
-            transferId:  (string) ($response['idPagamento'] ?? uniqid('SCHED-BB-', true)),
-            amount:      $request->amount,
-            status:      'scheduled',
-            currency:    'BRL',
-            message:     "Transferência agendada para {$date}",
+            transferId:  $transferId,
+            amount:      0,
+            currency:    Currency::BRL,
+            status:      PaymentStatus::CANCELLED,
+            message:     'Agendamento cancelado com sucesso',
             rawResponse: $response,
         );
     }
 
-    /**
-     * Cancela uma transferência agendada que ainda não foi processada.
-     *
-     * Endpoint: DELETE /pagamentos/v1/agendamentos/{id}
-     */
-    public function cancelScheduledTransfer(string $transferId): bool
-    {
-        $this->request('DELETE', self::PATH_PAGTOS . "/agendamentos/{$transferId}");
-
-        return true;
-    }
-
     // ══════════════════════════════════════════════════════════
-    //  SALDO E EXTRATO
-    // ══════════════════════════════════════════════════════════
-
-    /**
-     * Consulta o saldo da conta corrente.
-     *
-     * Endpoint: GET /conta-corrente/v1/saldo
-     *
-     * O BB retorna campos separados por tipo de bloqueio:
-     *   bloqueadoChequeEspecial, bloqueadoJudicial, bloqueadoAdministrativo.
-     * O campo 'disponivel' já desconta todos os bloqueios.
-     */
-    public function getBalance(): BalanceResponse
-    {
-        // FIX #8 — Passa agência e conta quando configurados, suportando multi-conta
-        $query = [];
-        if ($this->agencia !== '') {
-            $query['agencia'] = $this->agencia;
-        }
-        if ($this->conta !== '') {
-            $query['contaCorrente'] = $this->conta;
-        }
-
-        $response = $this->request('GET', self::PATH_CONTA . '/saldo', [], $query);
-
-        $available = (float) ($response['disponivel']                 ?? 0.0);
-        $blocked   = (float) ($response['bloqueadoChequeEspecial']    ?? 0.0)
-                   + (float) ($response['bloqueadoJudicial']          ?? 0.0)
-                   + (float) ($response['bloqueadoAdministrativo']    ?? 0.0);
-
-        return BalanceResponse::create(
-            success:          true,
-            availableBalance: $available,
-            totalBalance:     $available + $blocked,
-            currency:         'BRL',
-            rawResponse:      $response,
-            metadata:         [
-                'saldo_disponivel'          => $available,
-                'bloqueado_cheque_especial' => (float) ($response['bloqueadoChequeEspecial']  ?? 0.0),
-                'bloqueado_judicial'        => (float) ($response['bloqueadoJudicial']        ?? 0.0),
-                'bloqueado_administrativo'  => (float) ($response['bloqueadoAdministrativo']  ?? 0.0),
-                'limite_contrato'           => (float) ($response['limiteContrato']           ?? 0.0),
-                'utilizacao_limite'         => (float) ($response['utilizacaoLimite']         ?? 0.0),
-            ],
-        );
-    }
-
-    /**
-     * Consulta o extrato (lançamentos a crédito e débito) da conta corrente.
-     *
-     * Endpoint: GET /conta-corrente/v1/extrato/saldo-dia
-     *
-     * O BB exige datas no formato dd.mm.aaaa (ex.: 01.03.2025) nos parâmetros.
-     *
-     * @return array<int, array<string, mixed>> Lista de lançamentos do período.
-     */
-	public function getStatement(
-			DateTime $from,
-			DateTime $to,
-			int      $page    = 1,
-			int      $perPage = 50,
-		): array {
-			// page 1 → indice 0, page 2 → indice 50, etc.
-			$indice = ($page - 1) * $perPage;
-
-			$query = [
-				'dataInicioSaldo' => $from->format('d.m.Y'),
-				'dataFimSaldo'    => $to->format('d.m.Y'),
-				'indice'          => $indice,
-				'quantidade'      => $perPage,
-			];
-
-			if ($this->agencia !== '') {
-				$query['agencia'] = $this->agencia;
-			}
-			if ($this->conta !== '') {
-				$query['contaCorrente'] = $this->conta;
-			}
-
-			$response = $this->request('GET', self::PATH_CONTA . '/extrato/saldo-dia', [], $query);
-
-			/** @var array<int, array<string, mixed>> $lancamentos */
-			$lancamentos = $response['lancamentos'] ?? $response['listaLancamentos'] ?? [];
-			$total       = (int) ($response['quantidadeRegistros'] ?? count($lancamentos));
-
-			return [
-				'lancamentos'         => $lancamentos,
-				'quantidadeRegistros' => $total,
-				'indicePrimeiro'      => $indice,
-				'pagina'              => $page,
-				'totalPaginas'        => $perPage > 0 ? (int) ceil($total / $perPage) : null,
-			];
-		}
-
-    // ══════════════════════════════════════════════════════════
-    //  CONSULTAS
-    // ══════════════════════════════════════════════════════════
-
-    /**
-     * Consulta o status de uma cobrança PIX ou boleto.
-     *
-     * PIX    → GET /pix-bb/v2/cob/{txid}
-     * Boleto → GET /cobrancas/v2/boletos/{numero}?numeroConvenio=...
-     *
-     * @param string $transactionId txid (PIX) ou número do título (boleto)
-     * @param string $type          'pix' (padrão) | 'boleto'
-     */
-    public function getTransactionStatus(string $transactionId, string $type = 'pix'): PaymentResponse
-    {
-        if ($type === 'boleto') {
-            $response = $this->request(
-                'GET',
-                self::PATH_BOLETO . "/boletos/{$transactionId}",
-                [],
-                ['numeroConvenio' => $this->convenio],
-            );
-
-            return PaymentResponse::create(
-                success:       true,
-                transactionId: $transactionId,
-                status:        $this->mapBoletoStatus((string) ($response['situacao']      ?? '')),
-                amount:        (float)  ($response['valorOriginal'] ?? 0.0),
-                currency:      'BRL',
-                message:       'Boleto consultado com sucesso',
-                rawResponse:   $response,
-            );
-        }
-
-        // PIX (padrão)
-        $response = $this->request('GET', self::PATH_PIX . "/cob/{$transactionId}");
-
-        return PaymentResponse::create(
-            success:       true,
-            transactionId: $transactionId,
-            status:        $this->mapPixStatus((string) ($response['status']          ?? 'ATIVA')),
-            amount:        (float)  ($response['valor']['original'] ?? 0.0),
-            currency:      'BRL',
-            message:       'Cobrança PIX consultada com sucesso',
-            rawResponse:   $response,
-        );
-    }
-
-    /**
-     * Lista cobranças PIX com filtros opcionais.
-     *
-     * Endpoint: GET /pix-bb/v2/cob
-     *
-     * Filtros disponíveis (BACEN/BB):
-     *   inicio         — RFC3339 (obrigatório, default: -30 dias)
-     *   fim            — RFC3339 (obrigatório, default: agora)
-     *   status         — ATIVA | CONCLUIDA | REMOVIDA_PELO_USUARIO_RECEBEDOR | REMOVIDA_PELO_PSP
-     *   cpf / cnpj     — documento do devedor
-     *   paginaAtual    — número da página (default: 0)
-     *   itensPorPagina — itens por página (máx. 100)
-     *
-     * @param  array<string, mixed>             $filters
-     * @return array<int, array<string, mixed>>
-     */
-    public function listTransactions(array $filters = []): array
-    {
-        $query = array_merge(
-            [
-                'inicio' => (new DateTime('-30 days'))->format(DateTimeInterface::RFC3339),
-                'fim'    => (new DateTime())->format(DateTimeInterface::RFC3339),
-            ],
-            $filters,
-        );
-
-        $response = $this->request('GET', self::PATH_PIX . '/cob', [], $query);
-
-        /** @var array<int, array<string, mixed>> $cobranças */
-        $cobranças = $response['cobs'] ?? $response['cobranças'] ?? [];
-
-        return $cobranças;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  WEBHOOKS
-    // ══════════════════════════════════════════════════════════
-
-    /**
-     * Registra URLs de webhook para receber notificações do BB.
-     *
-     * O BB possui endpoints distintos para cada produto:
-     *
-     *   PIX    → PUT  /pix-bb/v2/webhook/{chave}
-     *             Notifica recebimentos PIX na chave configurada.
-     *
-     *   Boleto → POST /cobrancas/v2/webhooks
-     *             Notifica liquidações de boletos do convênio.
-     *
-     * A URL deve ser HTTPS e acessível publicamente.
-     * Em sandbox o BB envia notificações simuladas.
-     *
-     * @param string   $url    URL pública (HTTPS) que receberá os POSTs.
-     * @param string[] $events Eventos desejados: ['pix', 'boleto']. Vazio = ambos.
-     */
-    public function registerWebhook(string $url, array $events = []): WebhookResponse
-    {
-        $registerAll = $events === [];
-        $results     = [];
-
-        if ($registerAll || in_array('pix', $events, true)) {
-            if ($this->pixKey === '') {
-                throw new GatewayException('Chave PIX não configurada. Impossível registrar webhook PIX.');
-            }
-
-            $results['pix'] = $this->request(
-                'PUT',
-                self::PATH_PIX . "/webhook/{$this->pixKey}",
-                ['webhookUrl' => $url],
-            );
-        }
-
-        if (($registerAll || in_array('boleto', $events, true)) && $this->convenio !== 0) {
-            $results['boleto'] = $this->request(
-                'POST',
-                self::PATH_BOLETO . '/webhooks',
-                [
-                    'numeroConvenio' => $this->convenio,
-                    'urlWebhook'     => $url,
-                ],
-            );
-        }
-
-        return WebhookResponse::create(
-            success:     true,
-            webhookId:   uniqid('BB-WH-', true),
-            url:         $url,
-            events:      $events === [] ? ['pix', 'boleto'] : $events,
-            rawResponse: $results,
-        );
-    }
-
-    /**
-     * Consulta o webhook PIX registrado para a chave configurada.
-     *
-     * Endpoint: GET /pix-bb/v2/webhook/{chave}
-     *
-     * @return array<int, array<string, mixed>>
-     */
-    public function listWebhooks(): array
-    {
-        if ($this->pixKey === '') {
-            return [];
-        }
-
-        $response = $this->request('GET', self::PATH_PIX . "/webhook/{$this->pixKey}");
-
-        return [$response];
-    }
-
-    /**
-     * Remove o webhook PIX da chave configurada.
-     *
-     * Endpoint: DELETE /pix-bb/v2/webhook/{chave}
-     *
-     * @throws GatewayException Se a chave PIX não estiver configurada.
-     */
-    public function deleteWebhook(string $webhookId): bool
-    {
-        if ($this->pixKey === '') {
-            throw new GatewayException('Chave PIX não configurada. Impossível remover webhook.');
-        }
-
-        $this->request('DELETE', self::PATH_PIX . "/webhook/{$this->pixKey}");
-
-        return true;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  MÉTODOS NÃO SUPORTADOS PELO BANCO DO BRASIL
+    //  PAYMENT LINKS — NÃO SUPORTADO
     // ══════════════════════════════════════════════════════════
 
     /** @throws GatewayException */
-    public function createCreditCardPayment(CreditCardPaymentRequest $request): PaymentResponse
+    public function createPaymentLink(PaymentLinkRequest $request): PaymentLinkResponse
     {
         throw new GatewayException(
-            'Cartão de crédito não disponível no gateway Banco do Brasil. Use Asaas, PagarMe, Adyen ou Stripe.'
+            'Links de pagamento não disponíveis no Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
         );
     }
 
     /** @throws GatewayException */
-    public function tokenizeCard(array $cardData): string
+    public function getPaymentLink(string $linkId): PaymentLinkResponse
     {
-        throw new GatewayException('Tokenização de cartão não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Links de pagamento não disponíveis no Banco do Brasil.');
     }
 
     /** @throws GatewayException */
-    public function capturePreAuthorization(string $transactionId, ?float $amount = null): PaymentResponse
+    public function expirePaymentLink(string $linkId): PaymentLinkResponse
     {
-        throw new GatewayException('Pré-autorização não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Links de pagamento não disponíveis no Banco do Brasil.');
     }
 
-    /** @throws GatewayException */
-    public function cancelPreAuthorization(string $transactionId): PaymentResponse
-    {
-        throw new GatewayException('Pré-autorização não disponível no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function createDebitCardPayment(DebitCardPaymentRequest $request): PaymentResponse
-    {
-        throw new GatewayException(
-            'Cartão de débito não disponível no gateway Banco do Brasil. Use Asaas ou PagarMe.'
-        );
-    }
-
-    /** @throws GatewayException */
-    public function createSubscription(SubscriptionRequest $request): SubscriptionResponse
-    {
-        throw new GatewayException(
-            'Assinaturas recorrentes não disponíveis no gateway Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
-        );
-    }
-
-    /** @throws GatewayException */
-    public function cancelSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        throw new GatewayException('Assinaturas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function suspendSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        throw new GatewayException('Assinaturas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function reactivateSubscription(string $subscriptionId): SubscriptionResponse
-    {
-        throw new GatewayException('Assinaturas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function updateSubscription(string $subscriptionId, array $data): SubscriptionResponse
-    {
-        throw new GatewayException('Assinaturas não disponíveis no gateway Banco do Brasil.');
-    }
+    // ══════════════════════════════════════════════════════════
+    //  CLIENTES — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
 
     /** @throws GatewayException */
     public function createCustomer(CustomerRequest $request): CustomerResponse
@@ -1448,158 +1281,273 @@ final class BancoDoBrasilGateway implements PaymentGatewayInterface
     /** @throws GatewayException */
     public function updateCustomer(string $customerId, array $data): CustomerResponse
     {
-        throw new GatewayException('Gestão de clientes não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Gestão de clientes não disponível no Banco do Brasil.');
     }
 
     /** @throws GatewayException */
     public function getCustomer(string $customerId): CustomerResponse
     {
-        throw new GatewayException('Gestão de clientes não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Gestão de clientes não disponível no Banco do Brasil.');
     }
 
     /** @throws GatewayException */
     public function listCustomers(array $filters = []): array
     {
-        throw new GatewayException('Gestão de clientes não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Gestão de clientes não disponível no Banco do Brasil.');
     }
 
-    /** @throws GatewayException */
-    public function createPaymentLink(PaymentLinkRequest $request): PaymentLinkResponse
-    {
-        throw new GatewayException(
-            'Links de pagamento não disponíveis no gateway Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
-        );
-    }
-
-    /** @throws GatewayException */
-    public function getPaymentLink(string $linkId): PaymentLinkResponse
-    {
-        throw new GatewayException('Links de pagamento não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function expirePaymentLink(string $linkId): PaymentLinkResponse
-    {
-        throw new GatewayException('Links de pagamento não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function createSubAccount(array $data): array
-    {
-        throw new GatewayException('Sub-contas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function updateSubAccount(string $subAccountId, array $data): array
-    {
-        throw new GatewayException('Sub-contas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function getSubAccount(string $subAccountId): array
-    {
-        throw new GatewayException('Sub-contas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function activateSubAccount(string $subAccountId): array
-    {
-        throw new GatewayException('Sub-contas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function deactivateSubAccount(string $subAccountId): array
-    {
-        throw new GatewayException('Sub-contas não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function createWallet(array $data): array
-    {
-        throw new GatewayException(
-            'Wallets devem ser gerenciadas na camada de aplicação, não via API Banco do Brasil.'
-        );
-    }
-
-    /** @throws GatewayException */
-    public function creditWallet(string $walletId, float $amount): array
-    {
-        throw new GatewayException('Wallets não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function debitWallet(string $walletId, float $amount): array
-    {
-        throw new GatewayException('Wallets não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function getWalletBalance(string $walletId): BalanceResponse
-    {
-        throw new GatewayException('Wallets não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function transferBetweenWallets(string $fromWalletId, string $toWalletId, float $amount): TransferResponse
-    {
-        throw new GatewayException('Wallets não disponíveis no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function holdInEscrow(EscrowRequest $request): EscrowResponse
-    {
-        throw new GatewayException(
-            'Escrow/Custódia não disponível no gateway Banco do Brasil. Use C6Bank ou PagarMe.'
-        );
-    }
-
-    /** @throws GatewayException */
-    public function releaseEscrow(string $escrowId): EscrowResponse
-    {
-        throw new GatewayException('Escrow não disponível no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function partialReleaseEscrow(string $escrowId, float $amount): EscrowResponse
-    {
-        throw new GatewayException('Escrow não disponível no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function cancelEscrow(string $escrowId): EscrowResponse
-    {
-        throw new GatewayException('Escrow não disponível no gateway Banco do Brasil.');
-    }
-
-    /** @throws GatewayException */
-    public function splitPayment(array $data): array
-    {
-        throw new GatewayException(
-            'Split de pagamento não disponível no gateway Banco do Brasil. Use Asaas, PagarMe ou C6Bank.'
-        );
-    }
+    // ══════════════════════════════════════════════════════════
+    //  ANTIFRAUDE — NÃO SUPORTADO
+    // ══════════════════════════════════════════════════════════
 
     /** @throws GatewayException */
     public function analyzeTransaction(array $data): array
     {
-        throw new GatewayException('Antifraude não disponível no gateway Banco do Brasil via API pública.');
+        throw new GatewayException('Antifraude não disponível no Banco do Brasil via API pública.');
     }
 
     /** @throws GatewayException */
     public function addToBlacklist(array $data): bool
     {
-        throw new GatewayException('Blacklist/Antifraude não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Blacklist/Antifraude não disponível no Banco do Brasil.');
     }
 
     /** @throws GatewayException */
     public function removeFromBlacklist(string $id): bool
     {
-        throw new GatewayException('Blacklist/Antifraude não disponível no gateway Banco do Brasil.');
+        throw new GatewayException('Blacklist/Antifraude não disponível no Banco do Brasil.');
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  SALDO E EXTRATO
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Consulta o saldo da conta corrente.
+     *
+     * Endpoint: GET /conta-corrente/v1/saldo
+     *
+     * @throws GatewayException
+     */
+    public function getBalance(): BalanceResponse
+    {
+        $query = [];
+        if ($this->agencia !== '') {
+            $query['agencia'] = $this->agencia;
+        }
+        if ($this->conta !== '') {
+            $query['contaCorrente'] = $this->conta;
+        }
+
+        $response = $this->request('GET', self::PATH_CONTA . '/saldo', [], $query);
+
+        return BalanceResponse::create(
+            success:          true,
+            balance:          (float) ($response['saldoContabil']   ?? 0),
+            availableBalance: (float) ($response['saldoDisponivel'] ?? 0),
+            pendingBalance:   0.0,
+            currency:         Currency::BRL,
+            rawResponse:      $response,
+            metadata:         [
+                'bloqueado_judicial'       => $response['bloqueioJudicial']      ?? 0,
+                'bloqueado_administrativo' => $response['bloqueioAdministrativo'] ?? 0,
+            ],
+        );
+    }
+
+    /**
+     * Consulta o extrato paginado da conta corrente.
+     *
+     * Endpoint: GET /conta-corrente/v1/extrato/saldo-dia
+     *
+     * O BB exige datas no formato dd.mm.aaaa (ex.: 01.03.2025) nos parâmetros.
+     *
+     * FIX #2 — Indentação corrigida de tabs para 4 espaços (padrão PSR-12).
+     * FIX #3 — @return e @param corrigidos para refletir o shape real do array retornado.
+     *
+     * @param DateTime $from    Data inicial do período.
+     * @param DateTime $to      Data final do período.
+     * @param int      $page    Número da página (base 1). Padrão: 1.
+     * @param int      $perPage Registros por página. Padrão: 50.
+     *
+     * @return array{
+     *   lancamentos: array<int, array<string, mixed>>,
+     *   quantidadeRegistros: int,
+     *   indicePrimeiro: int,
+     *   pagina: int,
+     *   totalPaginas: int|null,
+     * }
+     *
+     * @throws GatewayException
+     */
+    public function getStatement(
+        DateTime $from,
+        DateTime $to,
+        int      $page    = 1,
+        int      $perPage = 50,
+    ): array {
+        // page 1 → indice 0, page 2 → indice 50, etc.
+        $indice = ($page - 1) * $perPage;
+
+        $query = [
+            'dataInicioSaldo' => $from->format('d.m.Y'),
+            'dataFimSaldo'    => $to->format('d.m.Y'),
+            'indice'          => $indice,
+            'quantidade'      => $perPage,
+        ];
+
+        if ($this->agencia !== '') {
+            $query['agencia'] = $this->agencia;
+        }
+        if ($this->conta !== '') {
+            $query['contaCorrente'] = $this->conta;
+        }
+
+        $response = $this->request('GET', self::PATH_CONTA . '/extrato/saldo-dia', [], $query);
+
+        /** @var array<int, array<string, mixed>> $lancamentos */
+        $lancamentos = $response['lancamentos'] ?? $response['listaLancamentos'] ?? [];
+        $total       = (int) ($response['quantidadeRegistros'] ?? count($lancamentos));
+
+        return [
+            'lancamentos'         => $lancamentos,
+            'quantidadeRegistros' => $total,
+            'indicePrimeiro'      => $indice,
+            'pagina'              => $page,
+            'totalPaginas'        => $perPage > 0 ? (int) ceil($total / $perPage) : null,
+        ];
     }
 
     /** @throws GatewayException */
-    public function getAnticipationSchedule(): array
+    public function getSettlementSchedule(array $filters = []): array
     {
-        throw new GatewayException('Antecipação de recebíveis não disponível via API pública do Banco do Brasil.');
+        throw new GatewayException(
+            'Cronograma de liquidação não disponível via API pública do Banco do Brasil.'
+        );
+    }
+
+    /** @throws GatewayException */
+    public function anticipateReceivables(array $data): array
+    {
+        throw new GatewayException(
+            'Antecipação de recebíveis não disponível via API pública do Banco do Brasil.'
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  WEBHOOKS
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Registra uma URL de webhook para notificações PIX ou Boleto.
+     *
+     * @param string               $url     URL pública HTTPS que receberá as notificações.
+     * @param array<string, mixed> $options Opções opcionais:
+     *   - type: 'pix' (padrão) | 'boleto'
+     *
+     * @return array<string, mixed>
+     * @throws GatewayException
+     */
+    public function registerWebhook(string $url, array $options = []): array
+    {
+        $type = strtolower($options['type'] ?? 'pix');
+
+        if ($type === 'boleto') {
+            return $this->request(
+                'PUT',
+                self::PATH_BOLETO . '/boletos/webhook',
+                ['webhookUrl' => $url, 'numeroConvenio' => $this->convenio],
+            );
+        }
+
+        // PIX: PUT /pix/v2/webhook/{chave}
+        $chave = urlencode($this->pixKey);
+        return $this->request(
+            'PUT',
+            self::PATH_PIX . "/webhook/{$chave}",
+            ['webhookUrl' => $url],
+        );
+    }
+
+    /**
+     * Lista os webhooks registrados para a chave PIX configurada.
+     *
+     * @return array<string, mixed>
+     * @throws GatewayException
+     */
+    public function listWebhooks(): array
+    {
+        $chave = urlencode($this->pixKey);
+        return $this->request('GET', self::PATH_PIX . "/webhook/{$chave}");
+    }
+
+    /**
+     * Remove o webhook registrado para a chave PIX configurada.
+     *
+     * @throws GatewayException
+     */
+    public function deleteWebhook(string $webhookId): bool
+    {
+        $chave = urlencode($this->pixKey);
+        $this->request('DELETE', self::PATH_PIX . "/webhook/{$chave}");
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  HELPERS PRIVADOS
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Formata um valor monetário como string com 2 casas decimais.
+     * O BB exige valores como "150.00" (string), não como float direto.
+     */
+    private function formatAmount(float $amount): string
+    {
+        return number_format($amount, 2, '.', '');
+    }
+
+    /**
+     * Remove formatação de CPF/CNPJ, mantendo apenas dígitos.
+     */
+    private function sanitizeDocument(string $document): string
+    {
+        return preg_replace('/\D/', '', $document) ?? '';
+    }
+
+    /**
+     * Retorna o tipo de inscrição do pagador:
+     *   1 = CPF (11 dígitos)
+     *   2 = CNPJ (14 dígitos)
+     */
+    private function documentType(string $document): int
+    {
+        return strlen($document) === 14 ? 2 : 1;
+    }
+
+    /**
+     * Resolve o nossoNumero para emissão de boleto.
+     *
+     * Em produção é obrigatório fornecer um número sequencial único via
+     * metadata['nossoNumero']. Em sandbox, gera um número baseado em microtime.
+     *
+     * ⚠ ATENÇÃO: em produção, SEMPRE forneça metadata['nossoNumero'] com um
+     * sequencial único para evitar duplicatas no convênio BB.
+     *
+     * @throws GatewayException Em produção sem nossoNumero informado.
+     */
+    private function resolveNossoNumero(BoletoPaymentRequest $request): string
+    {
+        if (!empty($request->metadata['nossoNumero'])) {
+            return str_pad((string) $request->metadata['nossoNumero'], 10, '0', STR_PAD_LEFT);
+        }
+
+        if (!$this->sandbox) {
+            throw new GatewayException(
+                'metadata["nossoNumero"] é obrigatório em produção para evitar duplicatas no convênio.'
+            );
+        }
+
+        // Sandbox: sequencial baseado em microtime — suficiente para testes
+        return str_pad((string) (int) (microtime(true) * 1000), 10, '0', STR_PAD_LEFT);
     }
 }
