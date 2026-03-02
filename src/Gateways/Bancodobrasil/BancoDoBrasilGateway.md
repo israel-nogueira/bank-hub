@@ -98,15 +98,15 @@ variacaoCarteira     → Variação da carteira (ex: 35)
 use IsraelNogueira\PaymentHub\Gateways\BancoDoBrasil\BancoDoBrasilGateway;
 
 $gateway = new BancoDoBrasilGateway(
-    clientId:         'seu-client-id',
-    clientSecret:     'seu-client-secret',
-    developerAppKey:  'gw-dev-app-key',      // sandbox
-    pixKey:           'sua-chave@pix.com',
-    convenio:         3128557,
+    clientId:         $_ENV['BB_CLIENT_ID'],
+    clientSecret:     $_ENV['BB_CLIENT_SECRET'],
+    developerAppKey:  'gw-dev-app-key',      // sandbox: gw-dev-app-key | produção: gw-app-key
+    pixKey:           $_ENV['BB_PIX_KEY'],
+    convenio:         (int) $_ENV['BB_CONVENIO'],
     carteira:         17,
     variacaoCarteira: 35,
-    agencia:          '0001',
-    conta:            '123456',
+    agencia:          $_ENV['BB_AGENCIA'],   // 4 dígitos, sem dígito verificador
+    conta:            $_ENV['BB_CONTA'],     // sem dígito verificador
     sandbox:          true,
     // certPath:      '/etc/ssl/bb/cert.pem', // obrigatório em produção
 );
@@ -161,12 +161,15 @@ $request = BoletoPaymentRequest::create(
 
 $boleto = $hub->createBoleto($request);
 
-echo $boleto->boletoId;       // Número do título
-echo $boleto->linhaDigitavel; // Linha digitável
-echo $boleto->boletoUrl;      // URL para impressão
+// createBoleto() retorna PaymentResponse — dados do boleto ficam em metadata[]
+echo $boleto->transactionId;                    // Número do título (campo 'numero' da API BB)
+echo $boleto->metadata['linhaDigitavel'];       // Linha digitável
+echo $boleto->metadata['boletoUrl'];            // URL para impressão/PDF
+echo $boleto->metadata['nossoNumero'];          // Nosso número registrado
+echo $boleto->metadata['codigoBarras'] ?? '';   // Código de barras (quando disponível)
 
 // Cancelar boleto — retorna PaymentResponse
-$cancelado = $gateway->cancelBoleto($boleto->boletoId);
+$cancelado = $gateway->cancelBoleto($boleto->transactionId);
 echo $cancelado->success ? 'Baixado' : $cancelado->message;
 ```
 
@@ -189,7 +192,8 @@ $request = BoletoPaymentRequest::create(
 
 $boleto = $hub->createBoleto($request);
 
-echo $boleto->linhaDigitavel;
+// Todos os dados ficam em metadata[]
+echo $boleto->metadata['linhaDigitavel'];
 echo $boleto->metadata['pixCopiaECola'];
 echo $boleto->metadata['qrCodePix'];
 ```
@@ -251,8 +255,8 @@ $gateway->cancelScheduledTransfer($agendado->transferId);
 // Saldo atual da conta
 $saldo = $hub->getBalance();
 
-echo $saldo->availableBalance;                          // Saldo disponível
-echo $saldo->totalBalance;                              // Saldo total (incluindo bloqueios)
+echo $saldo->availableBalance;                          // Saldo disponível (saldoDisponivel)
+echo $saldo->balance;                                   // Saldo contábil (saldoContabil)
 echo $saldo->metadata['bloqueado_judicial'];            // Valor bloqueado judicialmente
 echo $saldo->metadata['bloqueado_administrativo'];      // Valor bloqueado administrativamente
 
@@ -294,17 +298,20 @@ O BB envia notificações para a sua URL quando eventos ocorrem (PIX pago, bolet
 
 ```php
 // Registrar webhook
-$webhook = $gateway->registerWebhook(
+$gateway->registerWebhook(
     'https://seusite.com/webhooks/bb',
-    ['pix', 'boleto'] // ou vazio para registrar ambos
+    ['type' => 'pix'] // 'pix' (padrão) ou 'boleto'
 );
 
-// Listar webhooks
+// Listar webhooks da chave PIX configurada
 $webhooks = $gateway->listWebhooks();
 
-// Remover webhook
-$gateway->deleteWebhook($webhook->webhookId);
+// Remover webhook — usa internamente a pixKey configurada no construtor
+// (o argumento $webhookId é exigido pela interface mas ignorado pelo BB)
+$gateway->deleteWebhook('qualquer-valor');
 ```
+
+> **Nota:** O BB não tem um ID de webhook como outros gateways. O registro e a remoção são feitos direto na chave PIX configurada (`$pixKey`). Para boleto, use `['type' => 'boleto']` no `registerWebhook()`.
 
 ### Processando com BancoDoBrasilWebhookHandler
 

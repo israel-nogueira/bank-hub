@@ -10,7 +10,7 @@
 **A biblioteca PHP mais simples e elegante para pagamentos no Brasil** 🇧🇷
 
 ### 📚 Navegação Rápida
-[Instalação](#-instalação) • [Conceitos](docs/core-concepts.md) • [Cartão](docs/credit-card.md) • [PIX](docs/pix.md) • [Boleto](docs/boleto.md) • [Assinaturas](docs/subscriptions.md) • [Money](docs/money.md) • [Enums](docs/enums.md) • [FAQ](docs/faq.md)
+[Instalação](#-instalação) • [Conceitos](docs/core-concepts.md) • [Cartão](docs/credit-card.md) • [PIX](docs/pix.md) • [Boleto](docs/boleto.md) • [Assinaturas](docs/subscriptions.md) • [Money](docs/money.md) • [Enums](docs/enums.md) • [FAQ](docs/faq.md) • [Banco do Brasil](src/Gateways/Bancodobrasil/BancoDoBrasilGateway.md)
 
 </div>
 
@@ -48,6 +48,7 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 | 🔵 **Stripe** | ✅ Pronto | Cartão de Crédito, Assinaturas, Payment Intents, Clientes, Refunds, Pre-auth/Capture | [📖 Docs](src/Gateways/Stripe/readme.md) |
 | 💙 **PayPal** | ✅ Pronto | Cartão de Crédito, Assinaturas, PayPal Checkout, Refunds, Pre-auth/Capture | [📖 Docs](src/Gateways/PayPal/readme.md) |
 | 🟢 **EtherGlobalAssets** | ✅ Pronto | PIX (apenas) | [📖 Docs](src/Gateways/EtherGlobalAssets/readme.md) |
+| 🏦 **Banco do Brasil** | ✅ Pronto | PIX (QR Code Dinâmico v2), Boleto Bancário, Boleto Híbrido (Boleto + PIX), Estorno PIX, Transferências PIX/TED, Agendamento, Saldo, Extrato, Webhooks — mTLS obrigatório em produção | [📖 Docs](src/Gateways/Bancodobrasil/BancoDoBrasilGateway.md) |
 | 🏦 **Bank of America CashPro** | ✅ Pronto | Zelle (instantâneo, 24/7), ACH Same-Day, ACH Standard, Wire/Fedwire — roteamento automático por valor, webhooks Push Notification, agendamento ACH, cancelamento, saldo e extrato | [📖 Docs](src/Gateways/BofACashPro/readme.md) |
 
 > 🧪 **FakeBankGateway**: Gateway simulado completo que funciona **SEM internet, SEM API keys, SEM sandbox**. Use para desenvolver toda sua aplicação localmente e só conecte com APIs reais quando estiver pronto para produção!
@@ -55,6 +56,8 @@ O Payment Hub inclui o **FakeBankGateway** - um gateway de pagamento simulado qu
 > 📝 **Nota**: Gateways brasileiros (Asaas, Pagar.me, C6 Bank, MercadoPago, PagSeguro, EBANX) suportam PIX e Boleto. Gateways internacionais (Stripe, PayPal, Adyen) não suportam esses métodos nativos do Brasil.
 >
 > 🌎 **EBANX**: Gateway especializado em pagamentos internacionais para América Latina (7 países).
+>
+> 🏦 **Banco do Brasil**: Gateway bancário oficial do BB. Ideal para empresas que já possuem conta BB e precisam integrar PIX, boleto e transferências diretamente com o banco, sem intermediários. Exige certificado digital (mTLS) em produção e convênio para boletos — obtenha com seu gerente de relacionamento BB.
 >
 > 🏦 **Bank of America CashPro**: Gateway corporativo para operações bancárias nos EUA via Zelle, ACH e Wire. Ideal para fintechs que operam nos EUA e precisam receber e enviar dólares programaticamente. Requer conta BofA CashPro Online e licença Money Transmitter (FinCEN + estadual).
 
@@ -314,6 +317,69 @@ echo "📅 Vencimento: 15/03/2025\n";
 
 ---
 
+### 🏦 PIX + Boleto com Banco do Brasil
+
+```php
+use IsraelNogueira\PaymentHub\Gateways\BancoDoBrasil\BancoDoBrasilGateway;
+
+$gateway = new BancoDoBrasilGateway(
+    clientId:        $_ENV['BB_CLIENT_ID'],
+    clientSecret:    $_ENV['BB_CLIENT_SECRET'],
+    developerAppKey: $_ENV['BB_APP_KEY'],
+    pixKey:          'sua-chave@pix.com',
+    convenio:        (int) $_ENV['BB_CONVENIO'],
+    carteira:        17,
+    variacaoCarteira: 35,
+    sandbox:         true,
+);
+
+$hub = new PaymentHub($gateway);
+
+// PIX — QR Code Dinâmico
+$pix = $hub->createPixPayment(
+    PixPaymentRequest::create(
+        amount:           150.00,
+        customerName:     'Maria Silva',
+        customerDocument: '123.456.789-00',
+        description:      'Pedido #1234',
+    )
+);
+echo $pix->metadata['pixCopiaECola']; // código Copia e Cola
+echo $pix->metadata['location'];      // URL do QR Code
+
+// Boleto Híbrido (Boleto + PIX no mesmo título)
+$boleto = $hub->createBoleto(
+    BoletoPaymentRequest::create(
+        amount:           299.90,
+        customerName:     'João Pereira',
+        customerDocument: '987.654.321-00',
+        dueDate:          date('Y-m-d', strtotime('+5 days')),
+        metadata: [
+            'nossoNumero' => '0000000042', // sequencial único — obrigatório em produção
+            'address'     => 'Rua das Flores, 123',
+            'city'        => 'São Paulo',
+            'state'       => 'SP',
+            'zipCode'     => '01310-100',
+            'hibrido'     => true,         // ativa Boleto + PIX no mesmo título
+        ],
+    )
+);
+echo $boleto->metadata['linhaDigitavel'];
+echo $boleto->metadata['pixCopiaECola'];
+
+// Transferência (roteamento automático PIX ou TED)
+$transfer = $gateway->transfer(new TransferRequest(
+    amount:          200.00,
+    beneficiaryName: 'Carlos Mendes',
+    description:     'Pagamento fornecedor',
+    metadata:        ['pixKey' => 'carlos@email.com'], // omita para TED
+));
+```
+
+> ⚠️ **Em produção** o BB exige certificado digital mTLS (`certPath`) registrado no [Portal Developers BB](https://app.developers.bb.com.br). Sem ele a API retorna HTTP 503.
+
+---
+
 ## 🚀 Funcionalidades Avançadas
 
 ### 🔁 Assinaturas Recorrentes
@@ -456,6 +522,17 @@ $hub = new PaymentHub(new PagarMeGateway(
     secretKey: 'sk_test_xxxxxxxxxxxxxx',
     publicKey: 'pk_test_xxxxxxxxxxxxxx',
     sandbox: true
+));
+
+// Ou com Banco do Brasil (conta BB + convênio):
+$hub = new PaymentHub(new BancoDoBrasilGateway(
+    clientId:        $_ENV['BB_CLIENT_ID'],
+    clientSecret:    $_ENV['BB_CLIENT_SECRET'],
+    developerAppKey: $_ENV['BB_APP_KEY'],
+    pixKey:          $_ENV['BB_PIX_KEY'],
+    convenio:        (int) $_ENV['BB_CONVENIO'],
+    sandbox:         false,
+    certPath:        '/etc/ssl/bb/cert.pem', // obrigatório em produção
 ));
 
 // Todo o resto do código continua igual! 🎉
